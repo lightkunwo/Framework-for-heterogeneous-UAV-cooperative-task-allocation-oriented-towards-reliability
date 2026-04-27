@@ -1,0 +1,23 @@
+======================================================================
+UAV SWARM SEAD MISSION SIMULATION REPORT
+======================================================================
+
+Simulation Timestamp: 20260313_103659
+Mission Duration: 1010.12 seconds
+Number of UAVs: 3
+Number of Targets: 4
+
+SUBSYSTEM SELECTION EVENTS:
+----------------------------------------------------------------------
+Event 1:
+  Time: 112.25s
+  Failed UAV: 3
+  Selected UAVs: [1]
+  Subsystem Reliability: 0.997759
+
+Event 2:
+  Time: 1010.12s
+  Failed UAV: 1
+  Selected UAVs: [3]
+  Subsystem Reliability: 0.980045
+

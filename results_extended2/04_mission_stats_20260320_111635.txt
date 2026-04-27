@@ -1,0 +1,9 @@
+======================================================================
+UAV SWARM SEAD MISSION SIMULATION REPORT
+======================================================================
+
+Simulation Timestamp: 20260320_111635
+Mission Duration: 438.826 seconds
+Number of UAVs: 10
+Number of Targets: 20
+
