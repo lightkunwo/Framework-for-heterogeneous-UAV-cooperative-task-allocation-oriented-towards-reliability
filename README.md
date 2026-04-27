@@ -1,4 +1,4 @@
-# Multi-UAV Task Allocation in SEAD missions
+# Extend Multi-UAV Task Allocation in SEAD missions
 Task allocation alogrithms for multiple UAVs of SEAD missions and VRP.
 
 ## Introduction
@@ -64,10 +64,3 @@ python3 GA_VRP.py
 python3 PSO_VRP.py
 ```
 
-## Reference
-Considering that the proposed thesis has not been published yet, the related research is presented below for reference.
-* C. Xia, L. Yongtai, Y. Liyuan, and Q. Lijie, "Cooperative task assignment and track planning for multi-UAV attack mobile targets," Journal of Intelligent & Robotic Systems, vol. 100, pp. 1383-1400, 2020.
-* G. Xu, T. Long, Z. Wang, and L. Liu, "Target-bundled genetic algorithm for multi-unmanned aerial vehicle cooperative task assignment considering precedence constraints," Proceedings of the Institution of Mechanical Engineers, Part G: Journal of Aerospace Engineering, vol. 234, no. 3, pp. 760-773, 2020.
-* Z. Jia, J. Yu, X. Ai, X. Xu, and D. Yang, "Cooperative multiple task assignment problem with stochastic velocities and time windows for heterogeneous unmanned aerial vehicles using a genetic algorithm," Aerospace Science and Technology, vol. 76, pp. 112-125, 2018.
-* R. Patel, E. Rudnick-Cohen, S. Azarm, M. Otte, H. Xu, and J. W. Herrmann, "Decentralized task allocation in multi-agent systems using a decentralized genetic algorithm," in 2020 IEEE International Conference on Robotics and Automation (ICRA), 2020: IEEE, pp. 3770-3776. 
-* Z. Qin and Y. Yi, "Particle Swarm Optimization Algorithm with Real Number Encoding for Vehicle Routing Problem," 2011 International Conference of Information Technology, Computer Engineering and Management Sciences, Nanjing, China, 2011, pp. 118-121, doi: 10.1109/ICM.2011.360.
