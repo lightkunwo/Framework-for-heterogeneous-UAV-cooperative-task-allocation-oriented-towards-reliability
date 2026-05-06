@@ -77,6 +77,13 @@ def initialize_transfer_policy(simulator):
     simulator.ac_critic = None
     simulator.ac_actor_optimizer = None
     simulator.ac_critic_optimizer = None
+    simulator.use_numpy_actor_critic = bool(simulator.use_actor_critic and (not TORCH_AVAILABLE))
+    simulator.ac_np_alpha_w = None
+    simulator.ac_np_alpha_b = None
+    simulator.ac_np_beta_w = None
+    simulator.ac_np_beta_b = None
+    simulator.ac_np_critic_w = None
+    simulator.ac_np_critic_b = 0.0
     if simulator.use_torch_actor_critic:
         simulator.ac_device = torch.device("cpu")
         simulator.ac_actor_alpha = PolicyNet(simulator.ac_state_dim, simulator.ac_hidden_dim, 2).to(simulator.ac_device)
@@ -87,6 +94,15 @@ def initialize_transfer_policy(simulator):
             lr=simulator.ac_actor_lr
         )
         simulator.ac_critic_optimizer = torch.optim.Adam(simulator.ac_critic.parameters(), lr=simulator.ac_critic_lr)
+    elif simulator.use_numpy_actor_critic:
+        rng = np.random.default_rng(42)
+        scale = 0.05
+        simulator.ac_np_alpha_w = rng.normal(0.0, scale, size=(simulator.ac_state_dim, 2))
+        simulator.ac_np_alpha_b = np.zeros(2, dtype=float)
+        simulator.ac_np_beta_w = rng.normal(0.0, scale, size=(simulator.ac_state_dim, 2))
+        simulator.ac_np_beta_b = np.zeros(2, dtype=float)
+        simulator.ac_np_critic_w = rng.normal(0.0, scale, size=(simulator.ac_state_dim,))
+        simulator.ac_np_critic_b = 0.0
     simulator.ac_update_steps = 0
 
 
@@ -250,24 +266,48 @@ def _state_to_vector(simulator, subsystem_state):
                      d_uav_task, d_uav_task_std, d_uav_dispersion, idle_ratio], dtype=float)
 
 
+def _np_softmax(logits):
+    z = np.asarray(logits, dtype=float)
+    z = z - np.max(z)
+    ez = np.exp(z)
+    return ez / max(1e-12, float(np.sum(ez)))
+
+
+def _np_actor_probs(simulator, state_vec, actor_name):
+    s = np.asarray(state_vec, dtype=float)
+    if actor_name == "alpha":
+        logits = s @ simulator.ac_np_alpha_w + simulator.ac_np_alpha_b
+    else:
+        logits = s @ simulator.ac_np_beta_w + simulator.ac_np_beta_b
+    return _np_softmax(logits)
+
+
 def _actor_rebuild_prob(simulator, state_vec):
-    if not simulator.use_torch_actor_critic:
+    if simulator.use_torch_actor_critic:
+        with torch.no_grad():
+            s = torch.tensor(state_vec[np.newaxis, :], dtype=torch.float32, device=simulator.ac_device)
+            probs = simulator.ac_actor_alpha(s)
+            p = float(probs[0, 1].item())
+        return float(np.clip(p, 0.05, 0.95))
+    if getattr(simulator, 'use_numpy_actor_critic', False):
+        probs = _np_actor_probs(simulator, state_vec, "alpha")
+        return float(np.clip(float(probs[1]), 0.05, 0.95))
+    else:
         return 0.5
-    with torch.no_grad():
-        s = torch.tensor(state_vec[np.newaxis, :], dtype=torch.float32, device=simulator.ac_device)
-        probs = simulator.ac_actor_alpha(s)
-        p = float(probs[0, 1].item())
-    return float(np.clip(p, 0.05, 0.95))
 
 
 def _actor_internal_migrate_prob(simulator, state_vec):
-    if not simulator.use_torch_actor_critic:
+    if simulator.use_torch_actor_critic:
+        with torch.no_grad():
+            s = torch.tensor(state_vec[np.newaxis, :], dtype=torch.float32, device=simulator.ac_device)
+            probs = simulator.ac_actor_beta(s)
+            p = float(probs[0, 1].item())
+        return float(np.clip(p, 0.05, 0.95))
+    if getattr(simulator, 'use_numpy_actor_critic', False):
+        probs = _np_actor_probs(simulator, state_vec, "beta")
+        return float(np.clip(float(probs[1]), 0.05, 0.95))
+    else:
         return 0.5
-    with torch.no_grad():
-        s = torch.tensor(state_vec[np.newaxis, :], dtype=torch.float32, device=simulator.ac_device)
-        probs = simulator.ac_actor_beta(s)
-        p = float(probs[0, 1].item())
-    return float(np.clip(p, 0.05, 0.95))
 
 
 def _compute_policy_reward(simulator, prev_state, next_state, decision):
@@ -299,17 +339,53 @@ def _compute_policy_reward(simulator, prev_state, next_state, decision):
 
 
 def update_actor_critic(simulator, prev_state, next_state, decision, migrate_mode, terminal=False):
-    if not simulator.use_torch_actor_critic:
+    if not simulator.use_torch_actor_critic and not getattr(simulator, 'use_numpy_actor_critic', False):
         return
     s = _state_to_vector(simulator, prev_state)
     s_next = _state_to_vector(simulator, next_state)
     action_alpha = 1 if decision == 'rebuild' else 0
     action_beta = 1 if migrate_mode == 'internal' else 0
+    reward = _compute_policy_reward(simulator, prev_state, next_state, decision)
+
+    if getattr(simulator, 'use_numpy_actor_critic', False):
+        # Critic: linear value function V(s)=w^T s + b
+        value_s = float(np.dot(simulator.ac_np_critic_w, s) + simulator.ac_np_critic_b)
+        next_v = 0.0 if terminal else float(np.dot(simulator.ac_np_critic_w, s_next) + simulator.ac_np_critic_b)
+        td_target = reward + simulator.ac_gamma * next_v
+        td_delta = float(td_target - value_s)
+
+        # Critic SGD update (MSE gradient)
+        simulator.ac_np_critic_w += simulator.ac_critic_lr * td_delta * s
+        simulator.ac_np_critic_b += simulator.ac_critic_lr * td_delta
+
+        # Actor policy-gradient update with TD advantage
+        alpha_probs = _np_actor_probs(simulator, s, "alpha")
+        beta_probs = _np_actor_probs(simulator, s, "beta")
+        alpha_onehot = np.zeros(2, dtype=float)
+        beta_onehot = np.zeros(2, dtype=float)
+        alpha_onehot[action_alpha] = 1.0
+        beta_onehot[action_beta] = 1.0
+
+        grad_alpha_logits = alpha_onehot - alpha_probs
+        grad_beta_logits = beta_onehot - beta_probs
+        simulator.ac_np_alpha_w += simulator.ac_actor_lr * td_delta * np.outer(s, grad_alpha_logits)
+        simulator.ac_np_alpha_b += simulator.ac_actor_lr * td_delta * grad_alpha_logits
+        simulator.ac_np_beta_w += simulator.ac_actor_lr * td_delta * np.outer(s, grad_beta_logits)
+        simulator.ac_np_beta_b += simulator.ac_actor_lr * td_delta * grad_beta_logits
+
+        simulator.ac_update_steps += 1
+        if simulator.ac_update_steps % 25 == 0:
+            print(
+                f"[AC-NP] steps={simulator.ac_update_steps}, reward={reward:.3f}, td={td_delta:.3f}, "
+                f"alpha={float(alpha_probs[1]):.3f}, beta={float(beta_probs[1]):.3f}"
+            )
+        return
+
+    # Torch branch
     state_t = torch.tensor(s[np.newaxis, :], dtype=torch.float32, device=simulator.ac_device)
     next_state_t = torch.tensor(s_next[np.newaxis, :], dtype=torch.float32, device=simulator.ac_device)
     action_alpha_t = torch.tensor([[action_alpha]], dtype=torch.long, device=simulator.ac_device)
     action_beta_t = torch.tensor([[action_beta]], dtype=torch.long, device=simulator.ac_device)
-    reward = _compute_policy_reward(simulator, prev_state, next_state, decision)
     reward_t = torch.tensor([[reward]], dtype=torch.float32, device=simulator.ac_device)
     with torch.no_grad():
         next_v = torch.zeros((1, 1), dtype=torch.float32, device=simulator.ac_device)
@@ -359,7 +435,7 @@ def decide_replan_action(simulator, subsystem_state):
     uav_task_imbalance = float(np.clip(d_uav_task_std / max(1e-6, 0.5 * simulator.map_diag), 0.0, 1.0))
     formation_pressure = float(np.clip(d_uav_dispersion / max(1e-6, simulator.map_diag), 0.0, 1.0))
     idle_relief = float(np.clip(n_idle / n, 0.0, 1.0))
-    if simulator.use_torch_actor_critic:
+    if simulator.use_torch_actor_critic or getattr(simulator, 'use_numpy_actor_critic', False):
         state_vec = _state_to_vector(simulator, subsystem_state)
         alpha_rebuild = _actor_rebuild_prob(simulator, state_vec)
         beta_internal = _actor_internal_migrate_prob(simulator, state_vec)
@@ -965,7 +1041,9 @@ def run_main_process(simulator, uav, u2u_communication, gcs_init_solution_queue,
         if mode == "REPLAN_DIST" and waiting_for_replan:
             if time.time() - previous_u2g_time >= interval / 1.01:
                 previous_u2g_time = time.time()
-                u2g.put([uav.id, x_n, y_n, time.time() - start_time, theta_n, current_reliability, 1, local_subsystem_epoch])
+                # Keep GCS packet format consistent: [msg_type, uav_id, x, y, t, yaw, reliability, is_idle, ...]
+                u2g.put([0, uav.id, x_n, y_n, time.time() - start_time, theta_n, current_reliability, 1,
+                         local_subsystem_epoch])
             time.sleep(0.02)
             continue
 
@@ -1654,6 +1732,8 @@ class DynamicSEADMissionSimulator(object):
                   f"R_min={min_subsystem_reliability})")
             if self.use_torch_actor_critic:
                 print("🧠 Torch Actor-Critic Enabled for subsystem decision-making")
+            elif getattr(self, 'use_numpy_actor_critic', False):
+                print("🧠 Numpy Actor-Critic Enabled for subsystem decision-making")
             elif self.use_actor_critic:
                 print("⚠️  Torch unavailable. Fallback to heuristic decision policy.")
         else:
@@ -2722,7 +2802,7 @@ if __name__ == '__main__':
 
     base_locations = [[2500, 4000, np.pi / 2] for _ in range(10)]
     initial_states = [[float(base[0]), float(base[1]), float(base[2])] for base in base_locations]
-
+    print()
     print("=" * 70)
     print("=" * 70)
     print(f"withKT2UAV数量: {len(uav_id)}")
@@ -2736,7 +2816,7 @@ if __name__ == '__main__':
         reliability_alpha_dict={1: 0.00002, 2: 0.00003, 3: 0.00018},
         reliability_beta_dict={1: 0.0, 2: 0.0, 3: 0.0},
         failure_threshold=0.98,
-        save_dir=os.path.join(script_dir, 'results_extended5'),
+        save_dir=os.path.join(script_dir, 'result_extended6'),
         enable_subsystem=True,
         min_member_count=3,
         min_subsystem_reliability=0.95,
