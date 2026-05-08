@@ -2,6 +2,8 @@ import os
 import queue
 import random
 import time
+import builtins
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
 from datetime import datetime
 from math import cos, sin, hypot, exp
@@ -30,10 +32,66 @@ except Exception:
 
 plt.rcParams['font.family'] = 'WenQuanYi Micro Hei'
 
+# -------------------- Console Capture (main process) --------------------
+_GLOBAL_CONSOLE_LOG = []
+_CONSOLE_LOG_SHARED = None
+_CONSOLE_CAPTURE_INSTALLED = False
+_ORIGINAL_PRINT = builtins.print
+
+
+def _set_shared_console_log(shared_list):
+    global _CONSOLE_LOG_SHARED
+    _CONSOLE_LOG_SHARED = shared_list
+
+
+def _enable_console_capture():
+    """Tee print output to in-memory buffer for mission stats."""
+    global _CONSOLE_CAPTURE_INSTALLED, _ORIGINAL_PRINT
+    if _CONSOLE_CAPTURE_INSTALLED:
+        return
+
+    _ORIGINAL_PRINT = builtins.print
+
+    def _tee_print(*args, **kwargs):
+        sep = kwargs.get('sep', ' ')
+        end = kwargs.get('end', '\n')
+        try:
+            text = sep.join(str(a) for a in args)
+        except Exception:
+            text = ' '.join(repr(a) for a in args)
+        if end is None:
+            end = ''
+        if isinstance(end, str) and end not in ('', '\n'):
+            text = text + end
+        if _CONSOLE_LOG_SHARED is not None:
+            try:
+                _CONSOLE_LOG_SHARED.append(text)
+            except Exception:
+                _GLOBAL_CONSOLE_LOG.append(text)
+        else:
+            _GLOBAL_CONSOLE_LOG.append(text)
+            # keep buffer bounded to avoid uncontrolled growth
+            if len(_GLOBAL_CONSOLE_LOG) > 50000:
+                del _GLOBAL_CONSOLE_LOG[:10000]
+        _ORIGINAL_PRINT(*args, **kwargs)
+
+    builtins.print = _tee_print
+    _CONSOLE_CAPTURE_INSTALLED = True
+
+
+def _get_console_log_snapshot():
+    if _CONSOLE_LOG_SHARED is not None:
+        try:
+            return list(_CONSOLE_LOG_SHARED)
+        except Exception:
+            pass
+    return list(_GLOBAL_CONSOLE_LOG)
+
 
 if TORCH_AVAILABLE:
     class PolicyNet(nn.Module):
         def __init__(self, n_states, n_hiddens, n_actions):
+            print("torch available")
             super(PolicyNet, self).__init__()
             self.fc1 = nn.Linear(n_states, n_hiddens)
             self.fc2 = nn.Linear(n_hiddens, n_actions)
@@ -63,8 +121,8 @@ else:
         pass
 
 
-def initialize_transfer_policy(simulator):
-    simulator.use_actor_critic = True
+def initialize_transfer_policy(simulator, enable_rl_decision=True):
+    simulator.use_actor_critic = bool(enable_rl_decision)
     simulator.ac_state_dim = 10
     simulator.ac_hidden_dim = 64
     simulator.ac_gamma = 0.95
@@ -77,7 +135,15 @@ def initialize_transfer_policy(simulator):
     simulator.ac_critic = None
     simulator.ac_actor_optimizer = None
     simulator.ac_critic_optimizer = None
+    simulator.use_numpy_actor_critic = bool(simulator.use_actor_critic and (not TORCH_AVAILABLE))
+    simulator.ac_np_alpha_w = None
+    simulator.ac_np_alpha_b = None
+    simulator.ac_np_beta_w = None
+    simulator.ac_np_beta_b = None
+    simulator.ac_np_critic_w = None
+    simulator.ac_np_critic_b = 0.0
     if simulator.use_torch_actor_critic:
+        print("useAc")
         simulator.ac_device = torch.device("cpu")
         simulator.ac_actor_alpha = PolicyNet(simulator.ac_state_dim, simulator.ac_hidden_dim, 2).to(simulator.ac_device)
         simulator.ac_actor_beta = PolicyNet(simulator.ac_state_dim, simulator.ac_hidden_dim, 2).to(simulator.ac_device)
@@ -87,6 +153,15 @@ def initialize_transfer_policy(simulator):
             lr=simulator.ac_actor_lr
         )
         simulator.ac_critic_optimizer = torch.optim.Adam(simulator.ac_critic.parameters(), lr=simulator.ac_critic_lr)
+    # elif simulator.use_numpy_actor_critic:
+    #     rng = np.random.default_rng(42)
+    #     scale = 0.05
+    #     simulator.ac_np_alpha_w = rng.normal(0.0, scale, size=(simulator.ac_state_dim, 2))
+    #     simulator.ac_np_alpha_b = np.zeros(2, dtype=float)
+    #     simulator.ac_np_beta_w = rng.normal(0.0, scale, size=(simulator.ac_state_dim, 2))
+    #     simulator.ac_np_beta_b = np.zeros(2, dtype=float)
+    #     simulator.ac_np_critic_w = rng.normal(0.0, scale, size=(simulator.ac_state_dim,))
+    #     simulator.ac_np_critic_b = 0.0
     simulator.ac_update_steps = 0
 
 
@@ -250,24 +325,48 @@ def _state_to_vector(simulator, subsystem_state):
                      d_uav_task, d_uav_task_std, d_uav_dispersion, idle_ratio], dtype=float)
 
 
+def _np_softmax(logits):
+    z = np.asarray(logits, dtype=float)
+    z = z - np.max(z)
+    ez = np.exp(z)
+    return ez / max(1e-12, float(np.sum(ez)))
+
+
+def _np_actor_probs(simulator, state_vec, actor_name):
+    s = np.asarray(state_vec, dtype=float)
+    if actor_name == "alpha":
+        logits = s @ simulator.ac_np_alpha_w + simulator.ac_np_alpha_b
+    else:
+        logits = s @ simulator.ac_np_beta_w + simulator.ac_np_beta_b
+    return _np_softmax(logits)
+
+
 def _actor_rebuild_prob(simulator, state_vec):
-    if not simulator.use_torch_actor_critic:
+    if simulator.use_torch_actor_critic:
+        with torch.no_grad():
+            s = torch.tensor(state_vec[np.newaxis, :], dtype=torch.float32, device=simulator.ac_device)
+            probs = simulator.ac_actor_alpha(s)
+            p = float(probs[0, 1].item())
+        return float(np.clip(p, 0.05, 0.95))
+    if getattr(simulator, 'use_numpy_actor_critic', False):
+        probs = _np_actor_probs(simulator, state_vec, "alpha")
+        return float(np.clip(float(probs[1]), 0.05, 0.95))
+    else:
         return 0.5
-    with torch.no_grad():
-        s = torch.tensor(state_vec[np.newaxis, :], dtype=torch.float32, device=simulator.ac_device)
-        probs = simulator.ac_actor_alpha(s)
-        p = float(probs[0, 1].item())
-    return float(np.clip(p, 0.05, 0.95))
 
 
 def _actor_internal_migrate_prob(simulator, state_vec):
-    if not simulator.use_torch_actor_critic:
+    if simulator.use_torch_actor_critic:
+        with torch.no_grad():
+            s = torch.tensor(state_vec[np.newaxis, :], dtype=torch.float32, device=simulator.ac_device)
+            probs = simulator.ac_actor_beta(s)
+            p = float(probs[0, 1].item())
+        return float(np.clip(p, 0.05, 0.95))
+    if getattr(simulator, 'use_numpy_actor_critic', False):
+        probs = _np_actor_probs(simulator, state_vec, "beta")
+        return float(np.clip(float(probs[1]), 0.05, 0.95))
+    else:
         return 0.5
-    with torch.no_grad():
-        s = torch.tensor(state_vec[np.newaxis, :], dtype=torch.float32, device=simulator.ac_device)
-        probs = simulator.ac_actor_beta(s)
-        p = float(probs[0, 1].item())
-    return float(np.clip(p, 0.05, 0.95))
 
 
 def _compute_policy_reward(simulator, prev_state, next_state, decision):
@@ -293,23 +392,58 @@ def _compute_policy_reward(simulator, prev_state, next_state, decision):
     prev_idle = float(prev_state.get("N_idle", 0)) / prev_n
     next_idle = float(next_state.get("N_idle", 0)) / next_n
     idle_relief = float(np.clip(next_idle - prev_idle, -1.0, 1.0))
-    rebuild_cost = 0.08 if decision == "rebuild" else 0.0
-    reward = 1.20 * progress + 0.60 * rel_gain + 0.30 * type_gain + 0.25 * spread_gain + 0.15 * cohesion_gain + 0.10 * idle_relief - rebuild_cost
+    reward = 1.20 * progress + 0.60 * rel_gain + 0.30 * type_gain + 0.25 * spread_gain + 0.15 * cohesion_gain + 0.10 * idle_relief
     return float(reward)
 
 
 def update_actor_critic(simulator, prev_state, next_state, decision, migrate_mode, terminal=False):
-    if not simulator.use_torch_actor_critic:
+    if not simulator.use_torch_actor_critic and not getattr(simulator, 'use_numpy_actor_critic', False):
         return
     s = _state_to_vector(simulator, prev_state)
     s_next = _state_to_vector(simulator, next_state)
     action_alpha = 1 if decision == 'rebuild' else 0
     action_beta = 1 if migrate_mode == 'internal' else 0
+    reward = _compute_policy_reward(simulator, prev_state, next_state, decision)
+
+    if getattr(simulator, 'use_numpy_actor_critic', False):
+        # Critic: linear value function V(s)=w^T s + b
+        value_s = float(np.dot(simulator.ac_np_critic_w, s) + simulator.ac_np_critic_b)
+        next_v = 0.0 if terminal else float(np.dot(simulator.ac_np_critic_w, s_next) + simulator.ac_np_critic_b)
+        td_target = reward + simulator.ac_gamma * next_v
+        td_delta = float(td_target - value_s)
+
+        # Critic SGD update (MSE gradient)
+        simulator.ac_np_critic_w += simulator.ac_critic_lr * td_delta * s
+        simulator.ac_np_critic_b += simulator.ac_critic_lr * td_delta
+
+        # Actor policy-gradient update with TD advantage
+        alpha_probs = _np_actor_probs(simulator, s, "alpha")
+        beta_probs = _np_actor_probs(simulator, s, "beta")
+        alpha_onehot = np.zeros(2, dtype=float)
+        beta_onehot = np.zeros(2, dtype=float)
+        alpha_onehot[action_alpha] = 1.0
+        beta_onehot[action_beta] = 1.0
+
+        grad_alpha_logits = alpha_onehot - alpha_probs
+        grad_beta_logits = beta_onehot - beta_probs
+        simulator.ac_np_alpha_w += simulator.ac_actor_lr * td_delta * np.outer(s, grad_alpha_logits)
+        simulator.ac_np_alpha_b += simulator.ac_actor_lr * td_delta * grad_alpha_logits
+        simulator.ac_np_beta_w += simulator.ac_actor_lr * td_delta * np.outer(s, grad_beta_logits)
+        simulator.ac_np_beta_b += simulator.ac_actor_lr * td_delta * grad_beta_logits
+
+        simulator.ac_update_steps += 1
+        if simulator.ac_update_steps % 25 == 0:
+            print(
+                f"[AC-NP] steps={simulator.ac_update_steps}, reward={reward:.3f}, td={td_delta:.3f}, "
+                f"alpha={float(alpha_probs[1]):.3f}, beta={float(beta_probs[1]):.3f}"
+            )
+        return
+
+    # Torch branch
     state_t = torch.tensor(s[np.newaxis, :], dtype=torch.float32, device=simulator.ac_device)
     next_state_t = torch.tensor(s_next[np.newaxis, :], dtype=torch.float32, device=simulator.ac_device)
     action_alpha_t = torch.tensor([[action_alpha]], dtype=torch.long, device=simulator.ac_device)
     action_beta_t = torch.tensor([[action_beta]], dtype=torch.long, device=simulator.ac_device)
-    reward = _compute_policy_reward(simulator, prev_state, next_state, decision)
     reward_t = torch.tensor([[reward]], dtype=torch.float32, device=simulator.ac_device)
     with torch.no_grad():
         next_v = torch.zeros((1, 1), dtype=torch.float32, device=simulator.ac_device)
@@ -359,7 +493,7 @@ def decide_replan_action(simulator, subsystem_state):
     uav_task_imbalance = float(np.clip(d_uav_task_std / max(1e-6, 0.5 * simulator.map_diag), 0.0, 1.0))
     formation_pressure = float(np.clip(d_uav_dispersion / max(1e-6, simulator.map_diag), 0.0, 1.0))
     idle_relief = float(np.clip(n_idle / n, 0.0, 1.0))
-    if simulator.use_torch_actor_critic:
+    if simulator.use_torch_actor_critic or getattr(simulator, 'use_numpy_actor_critic', False):
         state_vec = _state_to_vector(simulator, subsystem_state)
         alpha_rebuild = _actor_rebuild_prob(simulator, state_vec)
         beta_internal = _actor_internal_migrate_prob(simulator, state_vec)
@@ -403,7 +537,7 @@ class KnowledgeTransferManager:
         self.task_type_to_uav_type = {
             1: {1, 2},
             2: {2, 3},
-            3: {1, 2},
+            3: {1},
         }
 
     @staticmethod
@@ -679,9 +813,193 @@ class KnowledgeTransferManager:
 
 def run_task_allocation_process_replan(simulator, ga2control_queue, control2ga_queue, output_interval=0.5):
     self = simulator
+    _set_shared_console_log(getattr(self, 'console_log_shared', None))
+    _enable_console_capture()
     population, update = None, True
+    print("replan:",self.targets_sites)#重规划目标
     mission = GA_SEAD(self.targets_sites, 100)
     transfer = KnowledgeTransferManager(self, mission) if self.enable_knowledge_transfer else None
+    last_subsystem_epoch = None
+    current_scope_uav_ids = []
+    current_task_pool = set()
+    current_seed = self._empty_chromosome_5rows()
+
+    def _is_nonempty_chromosome_5rows(chrom):
+        norm = self._normalize_chromosome_5rows(chrom)
+        return len(norm) == 5 and len(norm[0]) > 0
+
+    def _build_completed_task_set(uav_info):
+        completed = set()
+        snapshot = getattr(uav_info, "subsystem_state", {}) if isinstance(getattr(uav_info, "subsystem_state", {}), dict) else {}
+        merged = []
+        merged.extend(snapshot.get("completed_tasks_snapshot", []))
+        merged.extend(getattr(uav_info, "tasks_completed", []) or [])
+        for t in merged:
+            if isinstance(t, (list, tuple)) and len(t) >= 2:
+                try:
+                    completed.add((int(t[0]), int(t[1])))
+                except Exception:
+                    continue
+        return completed
+
+    def _compatible_uav_candidates(task_type, scope_ids, uav_info):
+        allowed_types = self.task_type_to_uav_types.get(int(task_type), set())
+        id2type = {int(uid): int(ut) for uid, ut in zip(self.uavs[0], self.uavs[1])}
+        active = set(int(uid) for uid in getattr(uav_info, "uav_id", []))
+        return [uid for uid in scope_ids if uid in active and id2type.get(uid) in allowed_types]
+
+    def _pick_uav_for_task(task_type, target_id, scope_ids, uav_info):
+        cands = _compatible_uav_candidates(task_type, scope_ids, uav_info)
+        if not cands:
+            return None
+        target_xy = self.targets_sites[int(target_id) - 1] if 1 <= int(target_id) <= len(self.targets_sites) else [0.0, 0.0]
+        state_map = {}
+        for uid, st in zip(getattr(uav_info, "uav_id", []), getattr(uav_info, "uav_states", [])):
+            try:
+                state_map[int(uid)] = st
+            except Exception:
+                continue
+        best_uid = cands[0]
+        best_d = float("inf")
+        for uid in cands:
+            st = state_map.get(uid, [0.0, 0.0, 0.0])
+            dx = float(st[0]) - float(target_xy[0])
+            dy = float(st[1]) - float(target_xy[1])
+            d = dx * dx + dy * dy
+            if d < best_d:
+                best_d = d
+                best_uid = uid
+        return best_uid
+
+    def _build_pool_seed_and_status(uav_info):
+        init_chrom = self._normalize_chromosome_5rows(getattr(self, "initial_solution_chromosome", None))
+        if len(init_chrom) != 5 or len(init_chrom[0]) == 0:
+            return self._empty_chromosome_5rows(), set(), [0 for _ in range(len(self.targets_sites))], []
+
+        scope_ids = getattr(uav_info, "scope_uav_ids", []) or getattr(uav_info, "uav_id", [])
+        scope_ids = [int(uid) for uid in scope_ids]
+        scope_set = set(scope_ids)
+
+        subsystem_state = getattr(uav_info, "subsystem_state", {})
+        failed_uav_id = None
+        if isinstance(subsystem_state, dict):
+            fv = subsystem_state.get("failed_uav_id", None)
+            if fv is not None:
+                try:
+                    failed_uav_id = int(fv)
+                except Exception:
+                    failed_uav_id = None
+
+        completed_set = _build_completed_task_set(uav_info)
+
+        rows = [[] for _ in range(5)]
+        task_pool = set()
+        L = min(len(init_chrom[0]), len(init_chrom[1]), len(init_chrom[2]), len(init_chrom[3]), len(init_chrom[4]))
+        ordered_idx = sorted(range(L), key=lambda i: int(init_chrom[0][i]))
+        for i in ordered_idx:
+            try:
+                tid = int(init_chrom[1][i])
+                ttype = int(init_chrom[2][i])
+                uid = int(init_chrom[3][i])
+                heading = int(init_chrom[4][i])
+            except Exception:
+                continue
+
+            if (tid, ttype) in completed_set:
+                continue
+
+            belongs_to_pool = (uid in scope_set) or (failed_uav_id is not None and uid == failed_uav_id)
+            if not belongs_to_pool:
+                continue
+
+            assign_uid = uid
+            if assign_uid not in scope_set:
+                reassigned = _pick_uav_for_task(ttype, tid, scope_ids, uav_info)
+                if reassigned is None:
+                    continue
+                assign_uid = reassigned
+
+            rows[0].append(len(rows[0]) + 1)
+            rows[1].append(tid)
+            rows[2].append(ttype)
+            rows[3].append(assign_uid)
+            rows[4].append(heading)
+            task_pool.add((tid, ttype))
+
+        seed = rows if len(rows[0]) > 0 else self._empty_chromosome_5rows()
+        status = [0 for _ in range(len(self.targets_sites))]
+        types_by_target = {}
+        for tid, ttype in task_pool:
+            types_by_target.setdefault(int(tid), set()).add(int(ttype))
+        for tid, tset in types_by_target.items():
+            if not tset:
+                continue
+            min_t = min(tset)
+            status[tid - 1] = max(status[tid - 1], 4 - min_t)
+
+        return seed, task_pool, status, scope_ids
+
+    def _refresh_task_index_cache():
+        mission.remaining_targets = [
+            target_id for target_id in range(1, len(mission.targets) + 1)
+            if not mission.tasks_status[target_id - 1] == 0
+        ]
+        mission.task_amount_array = [np.count_nonzero(np.array(mission.tasks_status) >= 3 - t) for t in range(3)]
+        mission.task_index_array = [
+            0,
+            mission.task_amount_array[0],
+            mission.task_amount_array[0] + mission.task_amount_array[1],
+        ]
+        mission.target_sequence = [
+            [index for (index, value) in enumerate(mission.tasks_status) if value == task_num]
+            for task_num in range(1, 4)
+        ]
+        mission.target_index_array = [0]
+        for k, times in enumerate(mission.tasks_status):
+            mission.target_index_array.append(mission.target_index_array[k] + times)
+
+    def _filter_chromosome_to_pool(chrom, pool, scope_ids, uav_info):
+        norm = self._normalize_chromosome_5rows(chrom)
+        if len(norm) != 5 or len(norm[0]) == 0 or not pool:
+            return self._empty_chromosome_5rows()
+        pool = set((int(t[0]), int(t[1])) for t in pool)
+        scope_set = set(int(uid) for uid in scope_ids)
+        rows = [[] for _ in range(5)]
+        L = min(len(norm[0]), len(norm[1]), len(norm[2]), len(norm[3]), len(norm[4]))
+        ordered_idx = sorted(range(L), key=lambda i: int(norm[0][i]))
+        for i in ordered_idx:
+            try:
+                tid = int(norm[1][i])
+                ttype = int(norm[2][i])
+                uid = int(norm[3][i])
+                heading = int(norm[4][i])
+            except Exception:
+                continue
+            if (tid, ttype) not in pool:
+                continue
+            assign_uid = uid
+            if assign_uid not in scope_set:
+                assign_uid = _pick_uav_for_task(ttype, tid, scope_ids, uav_info)
+                if assign_uid is None:
+                    continue
+            rows[0].append(len(rows[0]) + 1)
+            rows[1].append(tid)
+            rows[2].append(ttype)
+            rows[3].append(assign_uid)
+            rows[4].append(heading)
+        return rows if len(rows[0]) > 0 else self._empty_chromosome_5rows()
+
+    def _filter_population_to_pool(pop, pool, scope_ids, uav_info):
+        if not pop or not pool:
+            return pop
+        expected_len = int(sum(mission.tasks_status))
+        filtered = []
+        for ind in pop:
+            c = getattr(ind, "chromosome", None)
+            fc = _filter_chromosome_to_pool(c, pool, scope_ids, uav_info)
+            if _is_nonempty_chromosome_5rows(fc) and len(fc[0]) == expected_len:
+                filtered.append(mission.Chromosome(fc))
+        return filtered
 
     while True:
         uavs = control2ga_queue.get()
@@ -694,8 +1012,46 @@ def run_task_allocation_process_replan(simulator, ga2control_queue, control2ga_q
             update = False
             continue
 
+        epoch = int(getattr(uavs, "subsystem_epoch", 0) or 0)
+        epoch_changed = (epoch != last_subsystem_epoch)
+
+        if epoch_changed:
+            mission = GA_SEAD(self.targets_sites, 100)
+            transfer = KnowledgeTransferManager(self, mission) if self.enable_knowledge_transfer else None
+            try:
+                mission.information_setting(uavs, None, distributed=True)
+            except Exception as e:
+                print(f"[WARN][REPLAN_GA] init information_setting failed at epoch={epoch}: {e}")
+
+            seed, pool, status, scope_ids = _build_pool_seed_and_status(uavs)
+            current_seed = seed
+            current_task_pool = pool
+            current_scope_uav_ids = scope_ids
+            mission.tasks_status = list(status)
+            _refresh_task_index_cache()
+
+            expected_genes = int(sum(mission.tasks_status))
+            if _is_nonempty_chromosome_5rows(current_seed) and len(current_seed[0]) == expected_genes:
+                population = [mission.Chromosome([list(r) for r in current_seed])]
+                uavs.elite_chromosomes = [current_seed]
+                print(f"[WARM-START] epoch={epoch}, scope={current_scope_uav_ids}, pool_tasks={len(current_task_pool)}, genes={len(current_seed[0])}")
+            else:
+                population = None
+                print(f"[WARM-START] epoch={epoch}, no valid seed (expected_genes={expected_genes}), fallback to GA population.")
+            update = False
+            last_subsystem_epoch = epoch
+
+        if current_task_pool:
+            population = _filter_population_to_pool(population, current_task_pool, current_scope_uav_ids, uavs)
+            if (not population) and _is_nonempty_chromosome_5rows(current_seed):
+                population = [mission.Chromosome([list(r) for r in current_seed])]
+
         if transfer is not None:
             population, migrate_meta = transfer.maybe_apply_event_injection(population, uavs)
+            if current_task_pool:
+                population = _filter_population_to_pool(population, current_task_pool, current_scope_uav_ids, uavs)
+                if (not population) and _is_nonempty_chromosome_5rows(current_seed):
+                    population = [mission.Chromosome([list(r) for r in current_seed])]
         else:
             migrate_meta = {
                 'scope_key': tuple(sorted(getattr(uavs, 'scope_uav_ids', []))),
@@ -727,6 +1083,8 @@ def run_task_allocation_process_replan(simulator, ga2control_queue, control2ga_q
 
 def run_main_process(simulator, uav, u2u_communication, gcs_init_solution_queue, ga2replan_queue, replan2ga_queue, u2g, uav_failure=None, subsystem_queue=None):
     self = simulator
+    _set_shared_console_log(getattr(self, 'console_log_shared', None))
+    _enable_console_capture()
     targets_sites = self.targets_sites[:]
     x_n = uav.x0
     y_n = uav.y0
@@ -907,7 +1265,7 @@ def run_main_process(simulator, uav, u2u_communication, gcs_init_solution_queue,
                             scope_uav_ids = subsystem_members[:]
                             assist_replan_requested = False
                             print(
-                                f"✅ [UAV {uav.id}] Joined subsystem(id={current_subsystem_id}, epoch={local_subsystem_epoch}): {subsystem_members}, triggering distributed replanning...")
+                                f" [UAV {uav.id}] Joined subsystem(id={current_subsystem_id}, epoch={local_subsystem_epoch}): {subsystem_members}, triggering distributed replanning...")
                             print(
                                 f"   policy: decision={current_replan_decision}, alpha={current_rebuild_prob:.3f}, "
                                 f"beta={current_beta_internal:.3f}/{current_beta_external:.3f}, migrate_ratio={current_migrate_ratio:.2f}")
@@ -927,7 +1285,7 @@ def run_main_process(simulator, uav, u2u_communication, gcs_init_solution_queue,
                                 packets.clear()
                                 assist_replan_requested = False
                                 waiting_for_replan = False
-                            print(f"ℹ️  [UAV {uav.id}] Not in subsystem, keep executing current plan.")
+                            print(f"ℹ  [UAV {uav.id}] Not in subsystem, keep executing current plan.")
 
                 # [998, remove_id, epoch]
                 elif subsystem_msg[0] == 998:
@@ -938,7 +1296,7 @@ def run_main_process(simulator, uav, u2u_communication, gcs_init_solution_queue,
                         print(f"[PRUNE][UAV {uav.id}] remove UAV {remove_id}, new_scope={scope_uav_ids}")
 
             except Exception as e:
-                print(f"⚠️  [UAV {uav.id}] Error processing subsystem message: {e}")
+                print(f"⚠  [UAV {uav.id}] Error processing subsystem message: {e}")
 
         if uav.check_failure(time.time() - start_time, self.failure_threshold, cumulative_distance):
             print(f'💥 [UAV {uav.id}] FAILED at t={np.round(time.time() - start_time, 3)}s')
@@ -950,7 +1308,7 @@ def run_main_process(simulator, uav, u2u_communication, gcs_init_solution_queue,
             u2g.put([44, uav.id])
             break
 
-        # 仅REPLAN_DIST模式消费分布式GA结果
+        # 仅在分布式重规划模式且等待重规划结果时，才处理来自GA的重规划方案
         if mode == "REPLAN_DIST":
             while not ga2replan_queue.empty():
                 item = ga2replan_queue.get()
@@ -965,7 +1323,9 @@ def run_main_process(simulator, uav, u2u_communication, gcs_init_solution_queue,
         if mode == "REPLAN_DIST" and waiting_for_replan:
             if time.time() - previous_u2g_time >= interval / 1.01:
                 previous_u2g_time = time.time()
-                u2g.put([uav.id, x_n, y_n, time.time() - start_time, theta_n, current_reliability, 1, local_subsystem_epoch])
+                # Keep GCS packet format consistent: [msg_type, uav_id, x, y, t, yaw, reliability, is_idle, ...]
+                u2g.put([0, uav.id, x_n, y_n, time.time(), theta_n, current_reliability, 1,
+                         local_subsystem_epoch])
             time.sleep(0.02)
             continue
 
@@ -1202,6 +1562,10 @@ def generate_time_flow_plot(simulator, position, x, y, targets_sites, UAVs, fail
     self = simulator
     print("✓ 生成时间流图...")
 
+    if not position or all(len(track) == 0 for track in position):
+        print("⚠️  时间流图跳过：无可用轨迹数据")
+        return
+
     fig, axes = plt.subplots(3, 2, figsize=(16, 20))
     axes = axes.flatten()
 
@@ -1210,24 +1574,45 @@ def generate_time_flow_plot(simulator, position, x, y, targets_sites, UAVs, fail
     font_target = {'family': 'Times New Roman', 'weight': 'normal', 'color': 'm', 'size': 8}
     font_base = {'family': 'Times New Roman', 'weight': 'normal', 'color': 'r', 'size': 8}
 
-    max_length = len(max(position, key=len))
+    longest_track = max(position, key=len)
+    max_length = len(longest_track)
+    if max_length <= 0:
+        print("⚠️  时间流图跳过：轨迹点为空")
+        plt.close(fig)
+        return
     snapshot_indices = []
     time_points = []
-    longest_idx = position.index(max(position, key=len))
+    longest_idx = position.index(longest_track)
 
     for i in range(1, 7):
         index = max(0, min(int(max_length * i / 6) - 1, max_length - 1))
         snapshot_indices.append(index)
         if index < len(position[longest_idx]):
-            time_stamp = position[longest_idx][index][2] - start_time
+            raw_t = float(position[longest_idx][index][2])
         else:
-            time_stamp = position[longest_idx][-1][2] - start_time
+            raw_t = float(position[longest_idx][-1][2])
+        if raw_t < 1e6:
+            time_stamp = max(0.0, raw_t)
+        else:
+            time_stamp = max(0.0, raw_t - start_time)
         time_points.append(time_stamp)
 
     print(f"   Time snapshots: {[f'{t:.2f}s' for t in time_points]}")
     task_colors = {1: 'cyan', 2: 'orange', 3: 'green'}
 
-    for ax, snap_idx, time_stamp in zip(axes, snapshot_indices, time_points):
+    # 预计算每个 (target, task_type) 的完成时间序列，避免在每个子图里重复全表扫描。
+    completion_times = {}
+    for log in self.task_completion_log:
+        try:
+            key = (int(log['target_id']), int(log['task_type']))
+            completion_times.setdefault(key, []).append(float(log['time']))
+        except Exception:
+            continue
+    for key in completion_times:
+        completion_times[key].sort()
+
+    for panel_idx, (ax, snap_idx, time_stamp) in enumerate(zip(axes, snapshot_indices, time_points), start=1):
+        print(f"   rendering snapshot {panel_idx}/6 ...")
         ax.set_title(f't = {time_stamp:.2f}s', fontdict=font_title)
 
         for uav_idx in range(len(position)):
@@ -1263,18 +1648,14 @@ def generate_time_flow_plot(simulator, position, x, y, targets_sites, UAVs, fail
             ax.text(tgt[0] + 150, tgt[1] + 150, f'Target {target_idx + 1}', fontdict=font_target)
 
             for t_type in [1, 2, 3]:
-                completed = [
-                    log for log in self.task_completion_log
-                    if log['target_id'] == target_idx + 1 and
-                    log['task_type'] == t_type and
-                    log['time'] <= time_stamp
-                ]
-                executing = [
-                    log for log in self.task_completion_log
-                    if log['target_id'] == target_idx + 1 and
-                    log['task_type'] == t_type and
-                    abs(log['time'] - time_stamp) < 3.0
-                ]
+                times = completion_times.get((target_idx + 1, t_type), [])
+                if times:
+                    completed = bisect_right(times, time_stamp) > 0
+                    left = bisect_left(times, time_stamp - 3.0)
+                    executing = left < len(times) and abs(times[left] - time_stamp) < 3.0
+                else:
+                    completed = False
+                    executing = False
 
                 angle = (t_type - 1) * 2 * np.pi / 3
                 marker_x = tgt[0] + 400 * np.cos(angle)
@@ -1296,11 +1677,61 @@ def generate_time_flow_plot(simulator, position, x, y, targets_sites, UAVs, fail
         ax.grid(True, alpha=0.3, linestyle='--')
         ax.axis('equal')
 
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150, bbox_inches='tight')
     print(save_path)
     print(f"✓ 时间流图已保存: {save_path}")
-    plt.close()
+    plt.close(fig)
+
+
+def generate_task_sequence_plot(simulator, save_path):
+    self = simulator
+    print("✓ 生成任务时序图...")
+
+    if not self.task_completion_log:
+        print("⚠️  任务时序图跳过：暂无任务完成记录")
+        return
+
+    logs = sorted(self.task_completion_log, key=lambda x: float(x.get('time', 0.0)))
+    uav_ids = list(self.uavs[0])
+    target_num = len(self.targets_sites)
+    prev_finish_time = {uid: 0.0 for uid in uav_ids}
+    cmap = plt.get_cmap('tab20')
+    uav_colors = {uid: cmap(i % 20) for i, uid in enumerate(uav_ids)}
+
+    fig_h = max(10, int(target_num * 0.35))
+    fig, ax = plt.subplots(figsize=(18, fig_h))
+
+    for log in logs:
+        try:
+            uid = int(log['uav_id'])
+            tid = int(log['target_id'])
+            t_end = max(0.0, float(log.get('time', 0.0)))
+        except Exception:
+            continue
+
+        t_start = min(prev_finish_time.get(uid, 0.0), t_end)
+        width = max(0.5, t_end - t_start)
+        y0 = tid - 0.4
+        ax.broken_barh([(t_start, width)], (y0, 0.8),
+                       facecolors=uav_colors.get(uid, 'tab:blue'),
+                       edgecolors='black', linewidth=0.5, alpha=0.9)
+        ax.text(t_start + min(1.0, width * 0.15), tid, f'U{uid}',
+                fontsize=6, va='center', ha='left', color='black')
+        prev_finish_time[uid] = max(prev_finish_time.get(uid, 0.0), t_end)
+
+    ax.set_title('Task Sequence Timeline', fontsize=14, fontweight='bold')
+    ax.set_xlabel('Mission Time (s)', fontsize=12, fontweight='bold')
+    ax.set_ylabel('Target', fontsize=12, fontweight='bold')
+    ax.set_yticks(range(1, target_num + 1))
+    ax.set_yticklabels([f'T{i}' for i in range(1, target_num + 1)], fontsize=8)
+    ax.grid(True, axis='x', alpha=0.3, linestyle='--')
+    ax.set_axisbelow(True)
+
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f"✓ 任务时序图已保存: {save_path}")
+    plt.close(fig)
 
 
 def finalize_simulation_outputs(simulator, realtime_plot, replan2ga, start_time, position, distance,
@@ -1333,13 +1764,31 @@ def finalize_simulation_outputs(simulator, realtime_plot, replan2ga, start_time,
         if reliability_history[u]:
             uav_type_name = uav_type_names[self.uavs[1][u]]
             print(
-                f"  UAV {self.uavs[0][u]} ({uav_type_name}, α={UAVs[u].reliability_alpha}, β={UAVs[u].reliability_beta}): "
+                f"  UAV {self.uavs[0][u]} ({uav_type_name}, α={UAVs[u].reliability_alpha}): "
                 f"初始={reliability_history[u][0]:.4f}, 末期={reliability_history[u][-1]:.4f}, "
                 f"故障={'是' if failures[u] else '否'}"
             )
     print()
 
+    if self.final_unfinished_summary is None:
+        completed_pairs = [(int(log['target_id']), int(log['task_type'])) for log in self.task_completion_log]
+        alive_state = [0 if getattr(UAVs[i], 'is_failed', False) else 1 for i in range(uav_num)]
+        self.final_unfinished_summary = self._summarize_unfinished_tasks(completed_pairs, alive_state)
+    mission_status = self.final_unfinished_summary
+    if mission_status and mission_status.get('unfinished_total', 0) > 0:
+        print("未完成任务诊断:")
+        print(f"  剩余任务总数: {mission_status['unfinished_total']}")
+        print(f"  各类型剩余: {mission_status['unfinished_by_type']}")
+        print(f"  各类型不可执行数量: {mission_status['blocked_by_type']}")
+        print(f"  当前存活UAV类型: {mission_status['alive_uav_types']}")
+        if mission_status.get('sample_blocked_tasks'):
+            print(f"  示例不可执行任务: {mission_status['sample_blocked_tasks']}")
+        print()
+
     self.print_task_route_summary_task_style()
+
+    save_path_0 = os.path.join(self.save_dir, f'00_task_sequence_{self.timestamp}.png')
+    generate_task_sequence_plot(self, save_path_0)
 
     print("✓ 生成最终轨迹图...")
     fig, ax = plt.subplots(figsize=(12, 10))
@@ -1432,7 +1881,7 @@ def finalize_simulation_outputs(simulator, realtime_plot, replan2ga, start_time,
             line_style = '-' if self.uavs[0][i] in active_subsystem or not active_subsystem else '--'
             ax.plot(
                 time_history[i], reliability_history[i], line_style, linewidth=2, markersize=4,
-                label=f'UAV {self.uavs[0][i]} ({uav_type_name}, α={UAVs[i].reliability_alpha}, β={UAVs[i].reliability_beta})',
+                label=f'UAV {self.uavs[0][i]} ({uav_type_name}, α={UAVs[i].reliability_alpha})',
                 color=color_style[i]
             )
 
@@ -1496,6 +1945,17 @@ def finalize_simulation_outputs(simulator, realtime_plot, replan2ga, start_time,
         f.write(f'Number of UAVs: {uav_num}\n')
         f.write(f'Number of Targets: {target_num}\n\n')
 
+        if self.final_unfinished_summary:
+            ms = self.final_unfinished_summary
+            f.write('MISSION FEASIBILITY SUMMARY:\n')
+            f.write('-' * 70 + '\n')
+            f.write(f"Unfinished Total: {ms.get('unfinished_total', 0)}\n")
+            f.write(f"Unfinished By Type: {ms.get('unfinished_by_type', {})}\n")
+            f.write(f"Blocked By Type: {ms.get('blocked_by_type', {})}\n")
+            f.write(f"Feasible Count: {ms.get('feasible_count', 0)}\n")
+            f.write(f"Alive UAV Types: {ms.get('alive_uav_types', [])}\n")
+            f.write(f"Sample Blocked Tasks: {ms.get('sample_blocked_tasks', [])}\n\n")
+
         if self.subsystem_events:
             f.write('SUBSYSTEM SELECTION EVENTS:\n')
             f.write('-' * 70 + '\n')
@@ -1554,6 +2014,16 @@ def finalize_simulation_outputs(simulator, realtime_plot, replan2ga, start_time,
                         msg += f" | subsystem={log.get('subsystem_id')}"
                     f.write(msg + '\n')
 
+        f.write('\n' + '-' * 70 + '\n')
+        f.write('CONSOLE OUTPUT (MAIN PROCESS)\n')
+        f.write('-' * 70 + '\n')
+        console_lines = _get_console_log_snapshot()
+        if console_lines:
+            for line in console_lines:
+                f.write(str(line) + '\n')
+        else:
+            f.write('No console output captured.\n')
+
     print(f'✓ 统计文件已保存: {stats_path}\n')
     print(f'所有结果已保存到: {self.save_dir}\n')
 
@@ -1562,7 +2032,7 @@ plt.rcParams['font.family'] = 'WenQuanYi Micro Hei'
 
 
 class UAV(object):
-    def __init__(self, uav_id, uav_type, uav_velocity, uav_Rmin, initial_position, depot, reliability_alpha=0.0001, reliability_beta=0.0):
+    def __init__(self, uav_id, uav_type, uav_velocity, uav_Rmin, initial_position, depot, reliability_alpha=0.0001):
         self.id = uav_id
         self.type = uav_type
         self.velocity = uav_velocity
@@ -1573,7 +2043,6 @@ class UAV(object):
         self.theta0 = initial_position[2]
         self.depot = depot
         self.reliability_alpha = reliability_alpha
-        self.reliability_beta = reliability_beta
         self.start_time = None
         self.is_failed = False
         self.failure_time = None
@@ -1582,8 +2051,7 @@ class UAV(object):
         if self.start_time is None:
             self.start_time = current_time
         elapsed_time = current_time - self.start_time
-        effective_distance = max(0.0, float(cumulative_distance))
-        reliability = exp(-(self.reliability_alpha * elapsed_time + self.reliability_beta * effective_distance))
+        reliability = exp(-(self.reliability_alpha * elapsed_time))
         return max(0.0, min(1.0, reliability))
 
     def check_failure(self, current_time, threshold=0.98, cumulative_distance=0.0):
@@ -1600,19 +2068,14 @@ class UAV(object):
 class DynamicSEADMissionSimulator(object):
 
     def __init__(self, targets_sites, uav_id, uav_type, cruise_speed, turning_radii, initial_states, base_locations,
-                 reliability_alpha_dict=None, reliability_beta_dict=None, failure_threshold=0.98, save_dir='./simulation_results',
+                 reliability_alpha_dict=None, failure_threshold=0.98, save_dir='./simulation_results',
                  enable_subsystem=True, min_member_count=2, min_subsystem_reliability=0.95,
                  enable_assist_reallocation=True, assist_replan_cooldown=2.0,
-                 enable_knowledge_transfer=True):
+                 enable_knowledge_transfer=True, enable_rl_decision=True):
         self.targets_sites = targets_sites
         self.uavs = [uav_id, uav_type, cruise_speed, turning_radii, initial_states, base_locations, [], [], [], []]
 
-        self.reliability_alpha_dict = reliability_alpha_dict if reliability_alpha_dict else {
-            1: 0.0001, 2: 0.00015, 3: 0.00017
-        }
-        self.reliability_beta_dict = reliability_beta_dict if reliability_beta_dict else {
-            1: 1.0e-06, 2: 1.5e-06, 3: 2.2e-06
-        }
+        self.reliability_alpha_dict = reliability_alpha_dict
         self.failure_threshold = failure_threshold
         self.save_dir = save_dir
 
@@ -1622,6 +2085,14 @@ class DynamicSEADMissionSimulator(object):
         self.enable_assist_reallocation = enable_assist_reallocation
         self.assist_replan_cooldown = assist_replan_cooldown
         self.enable_knowledge_transfer = bool(enable_knowledge_transfer)
+        self.enable_rl_decision = bool(enable_rl_decision)
+        # Task type -> UAV type capability mapping
+        # 1: reconnaissance, 2: attack, 3: verification
+        self.task_type_to_uav_types = {
+            1: {1, 2},
+            2: {2, 3},
+            3: {1},
+        }
 
         # State-driven reallocation policy parameters
         self.rebuild_threshold_high = 0.65
@@ -1629,8 +2100,8 @@ class DynamicSEADMissionSimulator(object):
         self.external_migrate_ratio = 0.40
         self.internal_migrate_ratio = 0.15
 
-        # Actor-Critic for migration-policy decision is initialized inside second_migration.py
-        initialize_transfer_policy(self)
+        # Actor-Critic for migration-policy decision (can be disabled by switch)
+        initialize_transfer_policy(self, enable_rl_decision=self.enable_rl_decision)
 
         # For normalizing distance-style spatial indicators
         _norm_points = []
@@ -1648,27 +2119,34 @@ class DynamicSEADMissionSimulator(object):
         if self.enable_subsystem:
             self.subsystem_selector = SubsystemSelector(
                 min_subsystem_reliability=self.min_subsystem_reliability,
-                min_member_count=self.min_member_count
+                min_member_count=self.min_member_count,
+                strict_min_member_count=True
             )
-            print(f"✅ Subsystem Selector Enabled (type-aware, min_members={self.min_member_count}, "
-                  f"R_min={min_subsystem_reliability})")
+            print(f"✅ Subsystem Selector Enabled (type-coverage for type selection, "
+                  f"min_members={self.min_member_count}(hard), R_min={min_subsystem_reliability})")
             if self.use_torch_actor_critic:
-                print("🧠 Torch Actor-Critic Enabled for subsystem decision-making")
+                print(" Torch Actor-Critic Enabled for subsystem decision-making")
             elif self.use_actor_critic:
-                print("⚠️  Torch unavailable. Fallback to heuristic decision policy.")
+                print("Torch unavailable. Fallback to heuristic decision policy.")
+            else:
+                print("RL Decision Disabled. Using heuristic subsystem decision policy.")
         else:
             self.subsystem_selector = None
-            print("⚠️  Subsystem Selector Disabled")
+            print("子系统未启动")
 
         self.subsystem_events = []
         self.subsystem_reliability_history = []
         self.task_completion_log = []
         self.policy_history = []
+        self.console_log_shared = None
         self.initial_assignment_log = {}
+        self.initial_solution_chromosome = self._empty_chromosome_5rows()
+        self.final_unfinished_summary = None
 
         print(f"🤝 Assist Reallocation: {'Enabled' if self.enable_assist_reallocation else 'Disabled'} "
               f"(cooldown={self.assist_replan_cooldown}s)")
         print(f"🔄 Knowledge Transfer: {'Enabled' if self.enable_knowledge_transfer else 'Disabled'}")
+        print(f"🧠 RL Decision: {'Enabled' if self.enable_rl_decision else 'Disabled'}")
 
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
@@ -1768,12 +2246,12 @@ class DynamicSEADMissionSimulator(object):
 
     # -------- 集中式初次分配（单次求解）--------
     def run_initial_allocation_once(self):
-        mission = GA_SEAD(self.targets_sites, 100)
+        mission = GA_SEAD(self.targets_sites, 300)
         uavs_info = InformationOfUAVs(
             self.uavs[0], self.uavs[1], self.uavs[4], self.uavs[2], self.uavs[3], self.uavs[5],
             uav_best_solution=[self._empty_chromosome_5rows() for _ in self.uavs[0]]
         )
-        solution, _ = mission.run_GA_time_period_version(1.0, uavs_info, None, True, distributed=True)
+        solution, _ = mission.run_GA_time_period_version(0.5, uavs_info, None, True, distributed=True)
         return solution.fitness_value, solution.chromosome
 
     def collect_uav_states(self, position, reliability_history, UAVs):
@@ -1802,6 +2280,36 @@ class DynamicSEADMissionSimulator(object):
                 if task_tuple not in completed_set:
                     unfinished.append(task_tuple)
         return unfinished
+
+    def _alive_uav_types(self, alive_state):
+        alive_types = set()
+        for i, uid in enumerate(self.uavs[0]):
+            if i < len(alive_state) and alive_state[i] == 1:
+                alive_types.add(int(self.uavs[1][i]))
+        return alive_types
+
+    def _summarize_unfinished_tasks(self, completed_tasks_list, alive_state):
+        unfinished = self._extract_unfinished_tasks(completed_tasks_list)
+        summary = {
+            'unfinished_total': len(unfinished),
+            'unfinished_by_type': {1: 0, 2: 0, 3: 0},
+            'blocked_by_type': {1: 0, 2: 0, 3: 0},
+            'feasible_count': 0,
+            'alive_uav_types': sorted(self._alive_uav_types(alive_state)),
+            'sample_blocked_tasks': [],
+        }
+        alive_types = set(summary['alive_uav_types'])
+        for task in unfinished:
+            tid, ttype = int(task[0]), int(task[1])
+            summary['unfinished_by_type'][ttype] = summary['unfinished_by_type'].get(ttype, 0) + 1
+            allowed_types = self.task_type_to_uav_types.get(ttype, set())
+            if allowed_types & alive_types:
+                summary['feasible_count'] += 1
+            else:
+                summary['blocked_by_type'][ttype] = summary['blocked_by_type'].get(ttype, 0) + 1
+                if len(summary['sample_blocked_tasks']) < 8:
+                    summary['sample_blocked_tasks'].append((tid, ttype))
+        return summary
 
     def _encode_type_code(self, subsystem_uav_ids, alive_state):
         counts = {1: 0, 2: 0, 3: 0}
@@ -1983,8 +2491,6 @@ class DynamicSEADMissionSimulator(object):
         prev_idle = float(prev_state.get("N_idle", 0)) / prev_n
         next_idle = float(next_state.get("N_idle", 0)) / next_n
         idle_relief = float(np.clip(next_idle - prev_idle, -1.0, 1.0))
-
-        rebuild_cost = 0.08 if decision == "rebuild" else 0.0
         reward = (
             1.20 * progress
             + 0.60 * rel_gain
@@ -1992,7 +2498,6 @@ class DynamicSEADMissionSimulator(object):
             + 0.25 * spread_gain
             + 0.15 * cohesion_gain
             + 0.10 * idle_relief
-            - rebuild_cost
         )
         return float(reward)
 
@@ -2069,8 +2574,12 @@ class DynamicSEADMissionSimulator(object):
         )
 
     def start_simulation(self, realtime_plot=False, uav_failure=None):
+        _enable_console_capture()
         uav_num = len(self.uavs[0])
         target_num = len(self.targets_sites)
+        console_manager = mp.Manager()
+        self.console_log_shared = console_manager.list()
+        _set_shared_console_log(self.console_log_shared)
 
         u2u_nodes = [mp.Queue() for _ in range(uav_num)]
         GCS = mp.Queue()
@@ -2085,8 +2594,7 @@ class DynamicSEADMissionSimulator(object):
         gcs_init_solution_queues = [mp.Queue() for _ in range(uav_num)]
 
         UAVs = [UAV(self.uavs[0][n], self.uavs[1][n], self.uavs[2][n], self.uavs[3][n],
-                    self.uavs[4][n], self.uavs[5][n], self.reliability_alpha_dict[self.uavs[1][n]],
-                    self.reliability_beta_dict[self.uavs[1][n]])
+                    self.uavs[4][n], self.uavs[5][n], self.reliability_alpha_dict[self.uavs[1][n]])
                 for n in range(uav_num)]
 
         replan_process = mp.Process(
@@ -2116,7 +2624,7 @@ class DynamicSEADMissionSimulator(object):
         subsystem_epoch = 0
 
         color_style = ['tab:blue', 'tab:green', 'tab:orange', '#DC143C', '#808080', '#030764', '#C875C4', '#008080',
-                       '#DAA520', '#580F41', '#7BC8F6', '#06C2AC']
+                       '#DAA520', '#580F41', '#7BC8F6', '#06C2AC', '#2E8B57', '#FF8C00', '#8A2BE2', '#708090']
         font = {'family': 'Times New Roman', 'weight': 'normal', 'size': 8}
         font0 = {'family': 'Times New Roman', 'weight': 'normal', 'size': 10}
         font1 = {'family': 'Times New Roman', 'weight': 'normal', 'color': 'm', 'size': 8}
@@ -2153,6 +2661,7 @@ class DynamicSEADMissionSimulator(object):
 
         # GCS做一次集中式初始分配，并下发到每个UAV
         init_fit, init_solution = self.run_initial_allocation_once()
+        self.initial_solution_chromosome = self._normalize_chromosome_5rows(init_solution)
         self.initial_assignment_log = self._build_initial_assignment_log(init_solution)
         for q in gcs_init_solution_queues:
             q.put([init_fit, init_solution])
@@ -2160,15 +2669,16 @@ class DynamicSEADMissionSimulator(object):
         start_time = time.time()
         print("模拟开始!")
         print(f"故障阈值: {self.failure_threshold}")
-        print("各UAV类型的可靠度衰减系数(α, β):")
+        print("各UAV类型的可靠度衰减系数(α):")
         for uav_type, alpha in self.reliability_alpha_dict.items():
             uav_type_name = ["", "侦察型", "攻击型", "弹药型"][uav_type]
-            beta = self.reliability_beta_dict.get(uav_type, 0.0)
-            print(f"  类型{uav_type} ({uav_type_name}): α = {alpha}, β = {beta}")
+            print(f"  类型{uav_type} ({uav_type_name}): α = {alpha}")
         print(f"子系统选择: {'启用' if self.enable_subsystem else '禁用'}")
         if self.enable_subsystem:
-            print(f"  Type-aware minimum members: {self.min_member_count}")
+            print(f"  Min Members: {self.min_member_count} (hard)")
             print(f"  Min Reliability: {self.min_subsystem_reliability}")
+        print(f"知识迁移: {'启用' if self.enable_knowledge_transfer else '禁用'}")
+        print(f"强化学习决策: {'启用' if self.enable_rl_decision else '禁用'}")
         print("=" * 70)
 
         while state != completed:
@@ -2248,6 +2758,11 @@ class DynamicSEADMissionSimulator(object):
                             selected_uavs, reliability_history, state, all_completed_tasks, idle_flags,
                             uav_positions=uav_positions
                         )
+                        updated_subsystem_state["failed_uav_id"] = None
+                        updated_subsystem_state["completed_tasks_snapshot"] = [
+                            [int(t[0]), int(t[1])] if isinstance(t, (list, tuple)) and len(t) >= 2 else t
+                            for t in all_completed_tasks
+                        ]
                         self._update_actor_critic(subsystem_state, updated_subsystem_state, decision, migrate_mode)
 
                         subsystem_epoch += 1
@@ -2283,7 +2798,12 @@ class DynamicSEADMissionSimulator(object):
                 failure_reliability = surveillance[4]
                 failed_terminated_tasks = surveillance[5] if len(surveillance) > 5 else []
 
-                failures[self.uavs[0].index(failed_uav_id)] = len(position[position.index(max(position, key=len))])
+                failed_idx = self.uavs[0].index(failed_uav_id)
+                # Sync failure state in GCS-side UAV objects immediately.
+                if 0 <= failed_idx < len(UAVs):
+                    UAVs[failed_idx].is_failed = True
+                    UAVs[failed_idx].failure_time = time.time() - start_time
+                failures[failed_idx] = max(0, len(position[failed_idx]) - 1)
                 failure_uav_list.append(failure_pos)
 
 
@@ -2371,6 +2891,11 @@ class DynamicSEADMissionSimulator(object):
                         selected_uavs, reliability_history, state, all_completed_tasks, idle_flags,
                         uav_positions=uav_positions
                     )
+                    updated_subsystem_state["failed_uav_id"] = int(failed_uav_id)
+                    updated_subsystem_state["completed_tasks_snapshot"] = [
+                        [int(t[0]), int(t[1])] if isinstance(t, (list, tuple)) and len(t) >= 2 else t
+                        for t in all_completed_tasks
+                    ]
                     self._update_actor_critic(subsystem_state, updated_subsystem_state, decision, migrate_mode)
 
                     self.subsystem_events.append({
@@ -2566,6 +3091,11 @@ class DynamicSEADMissionSimulator(object):
                     selected_uavs, reliability_history, state, all_completed_tasks, idle_flags,
                     uav_positions=uav_positions
                 )
+                updated_subsystem_state["failed_uav_id"] = None
+                updated_subsystem_state["completed_tasks_snapshot"] = [
+                    [int(t[0]), int(t[1])] if isinstance(t, (list, tuple)) and len(t) >= 2 else t
+                    for t in all_completed_tasks
+                ]
                 self._update_actor_critic(subsystem_state, updated_subsystem_state, decision, migrate_mode)
 
                 subsystem_epoch += 1
@@ -2597,7 +3127,18 @@ class DynamicSEADMissionSimulator(object):
 
             else:
                 index = self.uavs[0].index(surveillance[1])
-                position[index].append([surveillance[2], surveillance[3], surveillance[4]])
+                raw_t = float(surveillance[4]) if len(surveillance) > 4 else 0.0
+                # Normalize mixed time sources:
+                # - absolute epoch time (time.time())
+                # - relative mission time (time.time()-start_time)
+                if raw_t < 1e6:
+                    rel_t = max(0.0, raw_t)
+                    abs_t = start_time + rel_t
+                else:
+                    abs_t = raw_t
+                    rel_t = max(0.0, raw_t - start_time)
+
+                position[index].append([surveillance[2], surveillance[3], abs_t])
                 x[index].append(surveillance[2])
                 y[index].append(surveillance[3])
                 yaw[index] = surveillance[5]
@@ -2606,7 +3147,7 @@ class DynamicSEADMissionSimulator(object):
                 is_idle = int(surveillance[7]) if len(surveillance) > 7 else 0
                 idle_flags[surveillance[1]] = bool(is_idle)
                 reliability_history[index].append(reliability)
-                time_history[index].append(surveillance[4] - start_time)
+                time_history[index].append(rel_t)
 
                 if realtime_plot:
                     ax_trajectory.cla()
@@ -2696,13 +3237,37 @@ class DynamicSEADMissionSimulator(object):
                     plt.tight_layout()
                     plt.pause(1e-5)
 
+            # Capability-aware deadlock check:
+            # If unfinished tasks remain but none can be executed by currently alive UAV types,
+            # terminate simulation early with explicit reason instead of waiting for all UAVs to fail.
+            mission_status = self._summarize_unfinished_tasks(all_completed_tasks, state)
+            if mission_status['unfinished_total'] > 0 and mission_status['feasible_count'] == 0:
+                self.final_unfinished_summary = mission_status
+                print("⚠️  Mission terminated early: remaining tasks are infeasible for alive UAV types.")
+                print(f"   alive_uav_types={mission_status['alive_uav_types']}, "
+                      f"unfinished_total={mission_status['unfinished_total']}, "
+                      f"unfinished_by_type={mission_status['unfinished_by_type']}, "
+                      f"blocked_by_type={mission_status['blocked_by_type']}")
+                if mission_status['sample_blocked_tasks']:
+                    print(f"   sample_blocked_tasks={mission_status['sample_blocked_tasks']}")
+                for i, proc in enumerate(main_processes):
+                    if proc.is_alive():
+                        proc.terminate()
+                    state[i] = 0
+                break
+
         finalize_simulation_outputs(
             self, realtime_plot, replan2ga, start_time, position, distance,
             active_subsystem, color_style, font, font0, font1, font2, base_plot_list,
             uav_num, reliability_history, failures, target_num, UAVs, time_history, x, y
         )
+        try:
+            console_manager.shutdown()
+        except Exception:
+            pass
 
 if __name__ == '__main__':
+    _enable_console_capture()
     script_dir = os.path.dirname(os.path.abspath(__file__))
     targets_sites = [
         [6734, 1453], [2233, 10], [5530, 1424], [401, 841], [3082, 1644], [7608, 4458],
@@ -2715,35 +3280,37 @@ if __name__ == '__main__':
         [7280, 4899], [7509, 3239], [10, 2676], [6807, 2993], [5185, 3258], [3023, 1942]
     ]
 
-    uav_id = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-    uav_type = [1, 2, 3, 1, 2, 3, 2, 2, 1, 3]
-    cruise_speed = [70, 80, 95, 75, 85, 90, 82, 88, 72, 92]
-    turning_radii = [200, 250, 300, 210, 260, 310, 245, 255, 190, 295]
+    uav_id = list(range(1, 14))
+    # 13架：type1=5, type2=4, type3=4
+    uav_type = [1, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3]
+    cruise_speed = [70, 72, 74, 76, 78, 82, 84, 86, 88, 90, 92, 94, 96]
+    turning_radii = [200, 205, 210, 215, 220, 245, 250, 255, 260, 290, 295, 300, 305]
 
-    base_locations = [[2500, 4000, np.pi / 2] for _ in range(10)]
+    base_locations = [[2500, 4000, np.pi / 2] for _ in range(len(uav_id))]
     initial_states = [[float(base[0]), float(base[1]), float(base[2])] for base in base_locations]
-
+    print(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     print("=" * 70)
     print("=" * 70)
-    print(f"withKT2UAV数量: {len(uav_id)}")
+    print("after modify replan")
+    print(f"withh13UAV数量: {len(uav_id)}")
     print(f"目标数量: {len(targets_sites)}")
-    print(f"总任务数asadad: {len(targets_sites) * 3} (侦察+攻击+验证)")
+    print(f"总任务数CZCCCzCd: {len(targets_sites) * 3} (侦察+攻击+验证)")
     print("UAV初始位置: 全部从njjnkjknknj基地位置出发")
     print("=" * 70 + "\n")
 
     dynamic_SEAD_mission = DynamicSEADMissionSimulator(
         targets_sites, uav_id, uav_type, cruise_speed, turning_radii, initial_states, base_locations,
-        reliability_alpha_dict={1: 0.00002, 2: 0.00003, 3: 0.00018},
-        reliability_beta_dict={1: 0.0, 2: 0.0, 3: 0.0},
-        failure_threshold=0.98,
-        save_dir=os.path.join(script_dir, 'results_extended5'),
+        reliability_alpha_dict={1: 0.00002, 2: 0.00009, 3: 0.00003},
+        failure_threshold=0.97,
+        save_dir=os.path.join(script_dir, 'result_extended7'),
         enable_subsystem=True,
-        min_member_count=3,
+        min_member_count=2,
         min_subsystem_reliability=0.95,
-        enable_knowledge_transfer=True
+        enable_knowledge_transfer=True,
+        enable_rl_decision=True
     )
 
-    manual_failures = [None for _ in range(10)]
+    manual_failures = [None for _ in range(len(uav_id))]
 
     dynamic_SEAD_mission.start_simulation(
         realtime_plot=False,

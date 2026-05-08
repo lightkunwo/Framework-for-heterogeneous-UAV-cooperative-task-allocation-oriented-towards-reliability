@@ -269,7 +269,7 @@ class GA_SEAD(object):
         self.uavType_for_missions = [[] for _ in range(3)]
         self.uav_num, self.target_num = len(self.uav_id), len(self.targets)
         # Classify capable UAVs to the missions
-        # [surveillance[1,3],attack[1,2,3],munition[2]], [surveillance[s,a],attack[a,m],verification[s,a]]
+        # [surveillance[1,3],attack[1,2,3],munition[2]], [surveillance[s,a],attack[a,m],verification[s]]
         for i, agent in enumerate(self.uav_type):
             if agent == 1:  # surveillance
                 self.uavType_for_missions[0].append(self.uav_id[i])
@@ -277,7 +277,6 @@ class GA_SEAD(object):
             elif agent == 2:  # attack, combat
                 self.uavType_for_missions[0].append(self.uav_id[i])
                 self.uavType_for_missions[1].append(self.uav_id[i])
-                self.uavType_for_missions[2].append(self.uav_id[i])
             elif agent == 3:  # munition
                 self.uavType_for_missions[1].append(self.uav_id[i])
         # COST TABLE (graph) -------------------------------------------------------------------------------------
