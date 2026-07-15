@@ -271,13 +271,13 @@ class GA_SEAD(object):
         # Classify capable UAVs to the missions
         # [surveillance[1,3],attack[1,2,3],munition[2]], [surveillance[s,a],attack[a,m],verification[s]]
         for i, agent in enumerate(self.uav_type):
-            if agent == 1:  # surveillance
+            if agent == 1:  # surveillance,verfection
                 self.uavType_for_missions[0].append(self.uav_id[i])
                 self.uavType_for_missions[2].append(self.uav_id[i])
-            elif agent == 2:  # attack, combat
+            elif agent == 2:  # attack, surveillance
                 self.uavType_for_missions[0].append(self.uav_id[i])
                 self.uavType_for_missions[1].append(self.uav_id[i])
-            elif agent == 3:  # munition
+            elif agent == 3:  # attack
                 self.uavType_for_missions[1].append(self.uav_id[i])
         # COST TABLE (graph) -------------------------------------------------------------------------------------
         if build_graph:
@@ -571,7 +571,7 @@ class InformationOfUAVs(object):
 if __name__ == "__main__":
     # targets
     targets = [[3100, 2200], [500, 3700], [2300, 2500], [2000, 3900], [4450, 3600], [4630, 4780], [1400, 4500]]
-    # UAVs
+    # UAVsasa
     UAV_ID = [1, 2, 3, 4, 5, 6]
     UAV_type = [1, 2, 3, 1, 3, 2]  # 1: surveillance, 2: attack, 3: munition
     cruising_speed = [70, 80, 90, 60, 100, 80]  # (m/s)

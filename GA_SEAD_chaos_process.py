@@ -11,12 +11,17 @@ class GA_SEAD(object):
                  heading_discretization=10, use_chaos=True, chaos_mu=4.0,
                  chaos_seed=None, chaos_map='piecewise', chaos_maps=None,
                  chaos_map_params=None, chaos_transform=None, chaos_in_operators=False,
-                 filter_duplicates=False, stagnation_chaos=True,
+                 chaos_seed_ratio=0.05, guided_seed_ratio=0.10, guided_distance_weight=2e-4,
+                 filter_duplicates=False, stagnation_chaos=False,
                  stagnation_chaos_patience=4, stagnation_replace_ratio=0.20,
+                 stagnation_chaos_max_rounds=1,
                  near_duplicate_threshold=None, duplicate_mutation_rounds=2,
                  chaos_early_stop=True, early_stop_min_generations=5,
                  early_stop_patience=8, early_stop_rel_tol=1e-4,
-                 early_stop_min_time_ratio=0.20):
+                 early_stop_min_time_ratio=0.20,
+                 local_refine=True, local_refine_passes=2,
+                 multi_start_offsets=(0.137, 0.101, 0.377),
+                 multi_start_distance_weight=0.001):
         self.targets = targets
         # Global message
         self.uav_id = []
@@ -72,11 +77,15 @@ class GA_SEAD(object):
         self.chaos_transform = chaos_transform
         self.chaos_state = self._init_chaos_state(chaos_seed)
         self.chaos_in_operators = chaos_in_operators
+        self.chaos_seed_ratio = float(np.clip(chaos_seed_ratio, 0.0, 1.0))
+        self.guided_seed_ratio = float(np.clip(guided_seed_ratio, 0.0, 1.0))
+        self.guided_distance_weight = float(max(0.0, guided_distance_weight))
         self._force_chaos_random = False
         self.filter_duplicates = filter_duplicates
         self.stagnation_chaos = stagnation_chaos
         self.stagnation_chaos_patience = stagnation_chaos_patience
         self.stagnation_replace_ratio = stagnation_replace_ratio
+        self.stagnation_chaos_max_rounds = stagnation_chaos_max_rounds
         self.near_duplicate_threshold = near_duplicate_threshold
         self.duplicate_mutation_rounds = duplicate_mutation_rounds
         self.chaos_early_stop = chaos_early_stop
@@ -84,6 +93,11 @@ class GA_SEAD(object):
         self.early_stop_patience = early_stop_patience
         self.early_stop_rel_tol = early_stop_rel_tol
         self.early_stop_min_time_ratio = early_stop_min_time_ratio
+        self.local_refine = local_refine
+        self.local_refine_passes = max(0, int(local_refine_passes))
+        self.multi_start_offsets = tuple(multi_start_offsets) if multi_start_offsets else (0.137,)
+        self.multi_start_distance_weight = float(max(0.0, multi_start_distance_weight))
+        self.multi_start_info = None
 
     @staticmethod
     def _default_chaos_maps(chaos_map):
@@ -238,11 +252,12 @@ class GA_SEAD(object):
                 return False
         return True
 
-    def _should_apply_stagnation_chaos(self, stale_generations):
+    def _should_apply_stagnation_chaos(self, stale_generations, applied_rounds=0):
         return (
             self.use_chaos
             and self.stagnation_chaos
             and self.stagnation_chaos_patience > 0
+            and applied_rounds < self.stagnation_chaos_max_rounds
             and stale_generations >= self.stagnation_chaos_patience
         )
 
@@ -332,29 +347,210 @@ class GA_SEAD(object):
             # Update fitness value
             chromosome.fitness_value = fitness
 
+    @staticmethod
+    def _metrics_cost_value(metrics):
+        fitness = metrics[0]
+        return float('inf') if fitness <= 0 else 1.0 / fitness
+
+    def _is_local_refine_better(self, candidate_metrics, best_metrics):
+        candidate_cost = self._metrics_cost_value(candidate_metrics)
+        best_cost = self._metrics_cost_value(best_metrics)
+        tol = 1e-9
+        if candidate_cost < best_cost - tol:
+            return True
+        if abs(candidate_cost - best_cost) > tol:
+            return False
+        if candidate_metrics[1] < best_metrics[1] - tol:
+            return True
+        return candidate_metrics[1] <= best_metrics[1] + tol and candidate_metrics[2] < best_metrics[2] - tol
+
+    def local_refine_solution(self, chromosome):
+        """Greedily polish the best chromosome without changing the GA objective."""
+        if not self.local_refine or self.local_refine_passes <= 0 or not hasattr(chromosome, 'chromosome'):
+            return chromosome
+        if not chromosome.chromosome or len(chromosome.chromosome) < 5 or not chromosome.chromosome[0]:
+            return chromosome
+
+        best_gene = chromosome.copy_chromosome()
+        best_chromosome = self.Chromosome(best_gene)
+        best_metrics = self.objectives_evaluation(best_chromosome)
+        gene_count = len(best_gene[0])
+
+        for _ in range(self.local_refine_passes):
+            improved = False
+            # Task-order repair lets the local search escape a good assignment with a poor execution order.
+            for left in range(gene_count - 1):
+                for right in range(left + 1, gene_count):
+                    candidate_gene = [row[:] for row in best_gene]
+                    for row in range(1, 5):
+                        candidate_gene[row][left], candidate_gene[row][right] = \
+                            candidate_gene[row][right], candidate_gene[row][left]
+                    candidate = self.Chromosome(candidate_gene)
+                    candidate_metrics = self.objectives_evaluation(candidate)
+                    if self._is_local_refine_better(candidate_metrics, best_metrics):
+                        best_gene = candidate_gene
+                        best_chromosome = candidate
+                        best_metrics = candidate_metrics
+                        improved = True
+
+            # Insertion repair handles cases where one task is good but appears too early or too late.
+            for source in range(gene_count):
+                for target in range(gene_count):
+                    if source == target:
+                        continue
+                    candidate_gene = [row[:] for row in best_gene]
+                    for row in range(1, 5):
+                        value = candidate_gene[row].pop(source)
+                        candidate_gene[row].insert(target, value)
+                    candidate = self.Chromosome(candidate_gene)
+                    candidate_metrics = self.objectives_evaluation(candidate)
+                    if self._is_local_refine_better(candidate_metrics, best_metrics):
+                        best_gene = candidate_gene
+                        best_chromosome = candidate
+                        best_metrics = candidate_metrics
+                        improved = True
+
+            for point in range(gene_count):
+                task_type = int(best_gene[2][point])
+                capable_uavs = self.uavType_for_missions[task_type - 1] \
+                    if 1 <= task_type <= len(self.uavType_for_missions) else [best_gene[3][point]]
+
+                # Heading repair is cheap and directly reduces Dubins transition cost.
+                for heading in self.discrete_integer_heading:
+                    if heading == best_gene[4][point]:
+                        continue
+                    candidate_gene = [row[:] for row in best_gene]
+                    candidate_gene[4][point] = heading
+                    candidate = self.Chromosome(candidate_gene)
+                    candidate_metrics = self.objectives_evaluation(candidate)
+                    if self._is_local_refine_better(candidate_metrics, best_metrics):
+                        best_gene = candidate_gene
+                        best_chromosome = candidate
+                        best_metrics = candidate_metrics
+                        improved = True
+
+                # Agent repair is more expensive, so it is evaluated after heading repair.
+                for uav_id in capable_uavs:
+                    if uav_id == best_gene[3][point]:
+                        continue
+                    for heading in self.discrete_integer_heading:
+                        candidate_gene = [row[:] for row in best_gene]
+                        candidate_gene[3][point] = uav_id
+                        candidate_gene[4][point] = heading
+                        candidate = self.Chromosome(candidate_gene)
+                        candidate_metrics = self.objectives_evaluation(candidate)
+                        if self._is_local_refine_better(candidate_metrics, best_metrics):
+                            best_gene = candidate_gene
+                            best_chromosome = candidate
+                            best_metrics = candidate_metrics
+                            improved = True
+            if not improved:
+                break
+
+        best_chromosome.fitness_value = best_metrics[0]
+        return best_chromosome
+
+    def generate_guided_chromosome(self):
+        """Build a cost-aware seed chromosome using chaos-randomized target order."""
+        genes = []
+        order = 1
+        costs = [0.0 for _ in range(self.uav_num)]
+        pre_site = [0 for _ in range(self.uav_num)]
+        pre_heading = [0 for _ in range(self.uav_num)]
+        finish_time_by_task = {}
+        id_to_index = {uid: idx for idx, uid in enumerate(self.uav_id)}
+
+        remaining_targets = [target_id for target_id in range(1, self.target_num + 1)
+                             if self.tasks_status[target_id - 1] > 0]
+        target_order = self._rand_shuffle(remaining_targets)
+
+        for target_id in target_order:
+            task_types = [n + 1 for n in range(3 - self.tasks_status[target_id - 1], 3)]
+            for task_type in task_types:
+                best = None
+                for uav_id in self.uavType_for_missions[task_type - 1]:
+                    if uav_id not in id_to_index:
+                        continue
+                    u = id_to_index[uav_id]
+                    for heading in self.discrete_integer_heading:
+                        leg = self.cost_graph[u][pre_site[u]][pre_heading[u]][target_id][heading]
+                        next_costs = list(costs)
+                        next_costs[u] += leg
+                        completion_time = next_costs[u] / self.uav_velocity[u]
+                        prev_finish = finish_time_by_task.get((target_id, task_type - 1), 0.0)
+                        precedence_penalty = max(0.0, prev_finish - completion_time)
+                        mission_time = float(np.max(np.divide(next_costs, self.uav_velocity)))
+                        total_distance = float(np.sum(next_costs))
+                        # Tiny chaotic jitter breaks ties without overpowering the cost-aware score.
+                        jitter = 1e-6 * self._rand_uniform() if self.use_chaos else 0.0
+                        distance_term = max(self.lambda_1, self.guided_distance_weight) * total_distance
+                        score = mission_time + distance_term + self.lambda_2 * precedence_penalty + jitter
+                        if best is None or score < best[0]:
+                            best = (score, u, uav_id, heading, leg, completion_time)
+                if best is None:
+                    # Fallback should be rare; keep feasibility if a capability list is empty.
+                    capable_uavs = self.uavType_for_missions[task_type - 1]
+                    uav_id = self._rand_choice(capable_uavs)
+                    u = id_to_index[uav_id]
+                    heading = self._rand_choice(self.discrete_integer_heading)
+                    leg = self.cost_graph[u][pre_site[u]][pre_heading[u]][target_id][heading]
+                    completion_time = (costs[u] + leg) / self.uav_velocity[u]
+                else:
+                    _, u, uav_id, heading, leg, completion_time = best
+                genes.append([order, target_id, task_type, uav_id, heading])
+                order += 1
+                costs[u] += leg
+                pre_site[u] = target_id
+                pre_heading[u] = heading
+                finish_time_by_task[(target_id, task_type)] = completion_time
+
+        return self.Chromosome(self.turn2order_based(genes)) if genes else self.Chromosome([[] for _ in range(5)])
+
     def generate_population(self):
-        def generate_chromosome():
+        def generate_chromosome(use_chaos_random=False):
             chromosome = np.zeros((5, sum(self.tasks_status)), dtype=int)
             for i in range(chromosome.shape[1]):
                 chromosome[0][i] = i + 1  # order
-                chromosome[1][i] = self._rand_choice([n for n in range(1, self.target_num + 1)
-                                                       if np.count_nonzero(chromosome[1] == n)
-                                                       < self.tasks_status[n - 1]])  # target id
+                candidates = [n for n in range(1, self.target_num + 1)
+                              if np.count_nonzero(chromosome[1] == n) < self.tasks_status[n - 1]]
+                chromosome[1][i] = self._rand_choice(candidates) if use_chaos_random \
+                    else random.choice(candidates)  # target id
             # turn to target-based
             target_bundle_chromosome = self.order2target_bundle(chromosome)
             for i in range(len(target_bundle_chromosome)):
                 target_bundle_chromosome[i][2] = mission_type_list[i]  # mission type
-                target_bundle_chromosome[i][3] = self._rand_choice(
-                    self.uavType_for_missions[target_bundle_chromosome[i][2] - 1])  # uav id
-                target_bundle_chromosome[i][4] = self._rand_choice(self.discrete_integer_heading)  # heading angle
+                capable_uavs = self.uavType_for_missions[target_bundle_chromosome[i][2] - 1]
+                target_bundle_chromosome[i][3] = self._rand_choice(capable_uavs) if use_chaos_random \
+                    else random.choice(capable_uavs)  # uav id
+                target_bundle_chromosome[i][4] = self._rand_choice(self.discrete_integer_heading) \
+                    if use_chaos_random else random.choice(self.discrete_integer_heading)  # heading angle
             return self.Chromosome(self.turn2order_based(target_bundle_chromosome))  # back to order-based
         mission_type_list = []
         for tasks in self.tasks_status:
             mission_type_list.extend([n + 1 for n in range(3 - tasks, 3)])
-        return [generate_chromosome() for _ in range(self.population_size)]
+        previous_force = self._force_chaos_random
+        chaos_count = int(round(self.population_size * self.chaos_seed_ratio)) if self.use_chaos else 0
+        guided_count = int(round(self.population_size * self.guided_seed_ratio)) if self.use_chaos else 0
+        chaos_count = min(chaos_count, self.population_size)
+        population = []
+        try:
+            for i in range(self.population_size):
+                # Use chaos only for a seed subset. The rest keeps the original fast random initialization.
+                self._force_chaos_random = i < chaos_count
+                population.append(generate_chromosome(use_chaos_random=i < chaos_count))
+            self._force_chaos_random = self.use_chaos
+            for _ in range(guided_count):
+                population.append(self.generate_guided_chromosome())
+            if len(population) > self.population_size:
+                self.fitness_evaluation(population)
+                population = sorted(population, key=lambda chromosome: chromosome.fitness_value, reverse=True)[:self.population_size]
+            random.shuffle(population)
+            return population
+        finally:
+            self._force_chaos_random = previous_force
 
     def selection(self, roulette_wheel, num):
-        if not self.use_chaos:
+        if not (self.use_chaos and self.chaos_in_operators):
             return np.random.choice(np.arange(len(roulette_wheel)), size=num, replace=False, p=roulette_wheel)
 
         selected = []
@@ -373,12 +569,17 @@ class GA_SEAD(object):
         return np.array(selected, dtype=int)
 
     def crossover_operator(self, wheel, population):
+        use_chaos_ops = self.use_chaos and self.chaos_in_operators
+
         def two_point_crossover(parent_1, parent_2):
             # turn to target-based
             target_based_gene = [self.order2target_bundle(parent_1.chromosome),
                                  self.order2target_bundle(parent_2.chromosome)]
             # choose cut point
-            cut_point_1, cut_point_2 = sorted(self._rand_sample(range(len(parent_1.chromosome[0])), 2))
+            if use_chaos_ops:
+                cut_point_1, cut_point_2 = sorted(self._rand_sample(range(len(parent_1.chromosome[0])), 2))
+            else:
+                cut_point_1, cut_point_2 = sorted(random.sample(range(len(parent_1.chromosome[0])), 2))
             cut_len = cut_point_2 - cut_point_1
             target_based_gene[0][cut_point_1:cut_point_2], target_based_gene[1][cut_point_1:cut_point_2] = \
                 [target_based_gene[0][cut_point_1 + i][:3] + target_based_gene[1][cut_point_1 + i][3:] for i in
@@ -395,8 +596,14 @@ class GA_SEAD(object):
             target_based_gene = [self.order2target_bundle(parent_1.chromosome),
                                  self.order2target_bundle(parent_2.chromosome)]
             # select targets to exchange
-            targets_exchanged = self._rand_sample(self.remaining_targets,
-                                                  self._rand_int(1, len(self.remaining_targets) + 1))
+            if use_chaos_ops:
+                targets_exchanged = self._rand_sample(
+                    self.remaining_targets, self._rand_int(1, len(self.remaining_targets) + 1)
+                )
+            else:
+                targets_exchanged = random.sample(
+                    self.remaining_targets, random.randint(1, len(self.remaining_targets))
+                )
             for target in targets_exchanged:
                 start_index = sum(self.tasks_status[:target - 1])
                 for i in range(start_index, start_index + self.tasks_status[target - 1]):
@@ -411,34 +618,45 @@ class GA_SEAD(object):
         children = []
         for k in range(0, self.crossover_num, 2):
             p_1, p_2 = self.selection(wheel, 2)
-            operator = self._weighted_choice([two_point_crossover, target_bundle_crossover],
-                                             self.crossover_operators_prob)
+            if use_chaos_ops:
+                operator = self._weighted_choice([two_point_crossover, target_bundle_crossover],
+                                                 self.crossover_operators_prob)
+            else:
+                operator = np.random.choice([two_point_crossover, target_bundle_crossover],
+                                            p=self.crossover_operators_prob)
             children.extend(operator(population[p_1], population[p_2]))
         return children
 
     def mutation_operator(self, wheel, population):
+        use_chaos_ops = self.use_chaos and self.chaos_in_operators
+
         def point_agent_mutation(chromosome):
             # choose a point to mutate
-            mut_point = self._rand_int(0, len(chromosome.chromosome[0]))
+            mut_point = self._rand_int(0, len(chromosome.chromosome[0])) if use_chaos_ops \
+                else np.random.randint(0, len(chromosome.chromosome[0]))
             new_gene = chromosome.copy_chromosome()
             # mutate assign UAV
-            new_gene[3][mut_point] = self._rand_choice(
-                [i for i in self.uavType_for_missions[new_gene[2][mut_point] - 1]])
+            candidates = [i for i in self.uavType_for_missions[new_gene[2][mut_point] - 1]]
+            new_gene[3][mut_point] = self._rand_choice(candidates) if use_chaos_ops else random.choice(candidates)
             return self.Chromosome(new_gene)
 
         def point_heading_mutation(chromosome):
             # choose a point to mutate
-            mut_point = self._rand_int(0, len(chromosome.chromosome[0]))
+            mut_point = self._rand_int(0, len(chromosome.chromosome[0])) if use_chaos_ops \
+                else np.random.randint(0, len(chromosome.chromosome[0]))
             new_gene = chromosome.copy_chromosome()
             # mutate assign heading
-            new_gene[4][mut_point] = self._rand_choice([i for i in self.discrete_integer_heading
-                                                        if i != chromosome.chromosome[4][mut_point]])
+            candidates = [i for i in self.discrete_integer_heading if i != chromosome.chromosome[4][mut_point]]
+            new_gene[4][mut_point] = self._rand_choice(candidates) if use_chaos_ops else random.choice(candidates)
             return self.Chromosome(new_gene)
 
         def target_bundle_mutation(chromosome):
             target_based_gene = self.order2target_bundle(chromosome.chromosome)
             for i, task_type in enumerate(self.target_sequence):
-                self.target_sequence[i] = self._rand_shuffle(task_type)
+                if use_chaos_ops:
+                    self.target_sequence[i] = self._rand_shuffle(task_type)
+                else:
+                    random.shuffle(task_type)
             shuffle_sequence = self.target_sequence[0] + self.target_sequence[1] + self.target_sequence[2]
             mutate_target_based = [[] for _ in range(len(target_based_gene))]
             j = 0
@@ -454,10 +672,13 @@ class GA_SEAD(object):
             # turn to target-based
             task_based_gene = self.order2task_bundle(chromosome.chromosome)
             # choose a task to mutate
-            mut_task = self._rand_int(0, 3)
+            mut_task = self._rand_int(0, 3) if use_chaos_ops else np.random.randint(0, 3)
             # shuffle the state
             task_sequence = list(range(self.task_amount_array[mut_task]))
-            task_sequence = self._rand_shuffle(task_sequence)
+            if use_chaos_ops:
+                task_sequence = self._rand_shuffle(task_sequence)
+            else:
+                random.shuffle(task_sequence)
             # copy
             chromosome_len, gene_len = len(task_based_gene), len(task_based_gene[0])
             mutate_task_based = [[0 for _ in range(gene_len)] for _ in range(chromosome_len)]
@@ -471,7 +692,10 @@ class GA_SEAD(object):
             return self.Chromosome(self.turn2order_based(mutate_task_based))
 
         mutation_operators = [point_agent_mutation, point_heading_mutation, target_bundle_mutation, task_bundle_mutation]
-        return [self._weighted_choice(mutation_operators, self.mutation_operators_prob)
+        if use_chaos_ops:
+            return [self._weighted_choice(mutation_operators, self.mutation_operators_prob)
+                    (population[self.selection(wheel, 1)[0]]) for _ in range(self.mutation_num)]
+        return [np.random.choice(mutation_operators, p=self.mutation_operators_prob)
                 (population[self.selection(wheel, 1)[0]]) for _ in range(self.mutation_num)]
 
     @staticmethod
@@ -496,22 +720,27 @@ class GA_SEAD(object):
         return match_ratio >= self.near_duplicate_threshold
 
     def _large_scope_chaos_mutation(self, chromosome):
-        new_gene = [list(row) for row in chromosome]
-        if len(new_gene) < 5 or not new_gene[0]:
-            return self.Chromosome(new_gene)
+        previous_force = self._force_chaos_random
+        self._force_chaos_random = True
+        try:
+            new_gene = [list(row) for row in chromosome]
+            if len(new_gene) < 5 or not new_gene[0]:
+                return self.Chromosome(new_gene)
 
-        gene_count = len(new_gene[0])
-        mutation_ratio = 0.25 + 0.25 * self._rand_uniform()
-        mutation_count = max(1, int(np.ceil(gene_count * mutation_ratio)))
-        for mut_point in self._rand_sample(range(gene_count), mutation_count):
-            task_type = int(new_gene[2][mut_point])
-            capable_uavs = self.uavType_for_missions[task_type - 1] \
-                if 1 <= task_type <= len(self.uavType_for_missions) else self.uav_id
-            if capable_uavs:
-                new_gene[3][mut_point] = self._rand_choice(capable_uavs)
-            if self.discrete_integer_heading:
-                new_gene[4][mut_point] = self._rand_choice(self.discrete_integer_heading)
-        return self.Chromosome(new_gene)
+            gene_count = len(new_gene[0])
+            mutation_ratio = 0.25 + 0.25 * self._rand_uniform()
+            mutation_count = max(1, int(np.ceil(gene_count * mutation_ratio)))
+            for mut_point in self._rand_sample(range(gene_count), mutation_count):
+                task_type = int(new_gene[2][mut_point])
+                capable_uavs = self.uavType_for_missions[task_type - 1] \
+                    if 1 <= task_type <= len(self.uavType_for_missions) else self.uav_id
+                if capable_uavs:
+                    new_gene[3][mut_point] = self._rand_choice(capable_uavs)
+                if self.discrete_integer_heading:
+                    new_gene[4][mut_point] = self._rand_choice(self.discrete_integer_heading)
+            return self.Chromosome(new_gene)
+        finally:
+            self._force_chaos_random = previous_force
 
     def chaotic_filter_population(self, population):
         if not self.use_chaos or not self.filter_duplicates or len(population) <= 1:
@@ -685,18 +914,21 @@ class GA_SEAD(object):
                 except IndexError:
                     return [[] for _ in range(5)], 1e5, [], 0
                 iteration -= 1
-            population = self.chaotic_filter_population(population)
+            if self.filter_duplicates:
+                population = self.chaotic_filter_population(population)
             self.fitness_evaluation(population)
             wheel = self.get_roulette_wheel(population)
             best_fitness = max([_.fitness_value for _ in population])
             stale_generations = 0
+            chaos_perturbations = 0
             fitness_convergence.append(1 / best_fitness)
             for generation in tqdm(range(iteration)):
                 new_population = []
                 new_population.extend(self.elitism_operator(population))
                 new_population.extend(self.crossover_operator(wheel, population))
                 new_population.extend(self.mutation_operator(wheel, population))
-                new_population = self.chaotic_filter_population(new_population)
+                if self.filter_duplicates:
+                    new_population = self.chaotic_filter_population(new_population)
                 self.fitness_evaluation(new_population)
                 wheel = self.get_roulette_wheel(new_population)
                 population = new_population
@@ -706,12 +938,135 @@ class GA_SEAD(object):
                     stale_generations = 0
                 else:
                     stale_generations += 1
+                if self.stagnation_chaos and self._should_apply_stagnation_chaos(stale_generations, chaos_perturbations):
+                    population = self.apply_stagnation_chaos(population)
+                    self.fitness_evaluation(population)
+                    wheel = self.get_roulette_wheel(population)
+                    current_best = max([_.fitness_value for _ in population])
+                    if self._is_meaningful_improvement(current_best, best_fitness):
+                        best_fitness = current_best
+                    stale_generations = 0
+                    chaos_perturbations += 1
                 fitness_convergence.append(1 / current_best)
                 if self._should_stop_early(generation + 1, stale_generations):
                     break
-            return self.find_best_solution(population), population, fitness_convergence
+            return self.local_refine_solution(self.find_best_solution(population)), population, fitness_convergence
         else:
             return [[] for _ in range(5)], 0, [], 0
+
+    def _clone_for_restart(self, chaos_seed):
+        return GA_SEAD(
+            [list(target) for target in self.targets],
+            population_size=self.total_population_size,
+            crossover_prob=self.crossover_prob,
+            elitism_num=self.elitism_num,
+            heading_discretization=self.heading_discretization,
+            use_chaos=self.use_chaos,
+            chaos_mu=self.chaos_mu,
+            chaos_seed=chaos_seed,
+            chaos_map=self.chaos_map,
+            chaos_maps=self.chaos_maps,
+            chaos_map_params=dict(self.chaos_map_params),
+            chaos_transform=self.chaos_transform,
+            chaos_in_operators=self.chaos_in_operators,
+            chaos_seed_ratio=self.chaos_seed_ratio,
+            guided_seed_ratio=self.guided_seed_ratio,
+            guided_distance_weight=self.guided_distance_weight,
+            filter_duplicates=self.filter_duplicates,
+            stagnation_chaos=self.stagnation_chaos,
+            stagnation_chaos_patience=self.stagnation_chaos_patience,
+            stagnation_replace_ratio=self.stagnation_replace_ratio,
+            stagnation_chaos_max_rounds=self.stagnation_chaos_max_rounds,
+            near_duplicate_threshold=self.near_duplicate_threshold,
+            duplicate_mutation_rounds=self.duplicate_mutation_rounds,
+            chaos_early_stop=self.chaos_early_stop,
+            early_stop_min_generations=self.early_stop_min_generations,
+            early_stop_patience=self.early_stop_patience,
+            early_stop_rel_tol=self.early_stop_rel_tol,
+            early_stop_min_time_ratio=self.early_stop_min_time_ratio,
+            local_refine=self.local_refine,
+            local_refine_passes=self.local_refine_passes,
+            multi_start_offsets=self.multi_start_offsets,
+            multi_start_distance_weight=self.multi_start_distance_weight,
+        )
+
+    def run_GA_multi_start(self, iteration, uav_message, population=None, distributed=False,
+                           base_seed=None, chaos_offsets=None, restart_distance_weight=None):
+        """Run several chaotic initial states and keep the best distance-aware result."""
+        offsets = tuple(chaos_offsets) if chaos_offsets else self.multi_start_offsets
+        distance_weight = self.multi_start_distance_weight if restart_distance_weight is None \
+            else float(max(0.0, restart_distance_weight))
+        if not self.use_chaos or len(offsets) <= 1:
+            result = self.run_GA(iteration, uav_message, population, distributed)
+            solution = result[0]
+            fitness, mission_time, total_distance, penalty = self.objectives_evaluation(solution)
+            self.multi_start_info = {
+                'best_offset': offsets[0] if offsets else None,
+                'restart_count': 1,
+                'cost_value': 1.0 / fitness if fitness > 0 else float('inf'),
+                'mission_time': mission_time,
+                'total_distance': total_distance,
+                'penalty': penalty,
+                'selection_score': 1.0 / fitness if fitness > 0 else float('inf'),
+                'attempts': [],
+            }
+            return result
+
+        best_record = None
+        attempts = []
+        for index, offset in enumerate(offsets):
+            if base_seed is None:
+                chaos_seed = self._safe_unit(self.chaos_state + float(offset) + index * 0.173)
+            else:
+                random.seed(int(base_seed))
+                np.random.seed(int(base_seed) % (2 ** 32 - 1))
+                chaos_seed = (float(base_seed) * float(offset)) % 1.0
+            restart_ga = self._clone_for_restart(chaos_seed)
+            start_time = time.time()
+            solution, restart_population, convergence = restart_ga.run_GA(
+                iteration, uav_message, population=None, distributed=distributed
+            )
+            elapsed = time.time() - start_time
+            fitness, mission_time, total_distance, penalty = restart_ga.objectives_evaluation(solution)
+            cost_value = 1.0 / fitness if fitness > 0 else float('inf')
+            selection_score = cost_value + distance_weight * total_distance
+            record = {
+                'ga': restart_ga,
+                'solution': solution,
+                'population': restart_population,
+                'convergence': convergence,
+                'offset': offset,
+                'chaos_seed': chaos_seed,
+                'elapsed_sec': elapsed,
+                'generations': max(0, len(convergence) - 1),
+                'fitness': fitness,
+                'cost_value': cost_value,
+                'mission_time': mission_time,
+                'total_distance': total_distance,
+                'penalty': penalty,
+                'selection_score': selection_score,
+            }
+            attempts.append({key: value for key, value in record.items()
+                             if key not in ('ga', 'solution', 'population', 'convergence')})
+            if best_record is None or selection_score < best_record['selection_score']:
+                best_record = record
+
+        best_ga = best_record['ga']
+        self.__dict__.update(best_ga.__dict__)
+        self.multi_start_info = {
+            'best_offset': best_record['offset'],
+            'best_chaos_seed': best_record['chaos_seed'],
+            'restart_count': len(offsets),
+            'cost_value': best_record['cost_value'],
+            'mission_time': best_record['mission_time'],
+            'total_distance': best_record['total_distance'],
+            'penalty': best_record['penalty'],
+            'selection_score': best_record['selection_score'],
+            'total_elapsed_sec': sum(attempt['elapsed_sec'] for attempt in attempts),
+            'total_generations': sum(attempt['generations'] for attempt in attempts),
+            'attempts': attempts,
+        }
+        return best_record['solution'], best_record['population'], best_record['convergence']
 
     def run_GA_time_period_version(self, time_interval, uav_message, population=None, update=True, distributed=False):
         iteration = 0
@@ -723,18 +1078,21 @@ class GA_SEAD(object):
             self.crossover_operators_prob = [0, 1] if residual_tasks <= 1 else [0.5, 0.5]
             if not population:
                 population = self.generate_population()
-            population = self.chaotic_filter_population(population)
+            if self.filter_duplicates:
+                population = self.chaotic_filter_population(population)
             self.fitness_evaluation(population)
             wheel = self.get_roulette_wheel(population)
             best_fitness = max([_.fitness_value for _ in population])
             stale_generations = 0
+            chaos_perturbations = 0
             while time.time() - start_time <= time_interval:
                 iteration += 1
                 new_population = []
                 new_population.extend(self.elitism_operator(population))
                 new_population.extend(self.crossover_operator(wheel, population))
                 new_population.extend(self.mutation_operator(wheel, population))
-                new_population = self.chaotic_filter_population(new_population)
+                if self.filter_duplicates:
+                    new_population = self.chaotic_filter_population(new_population)
                 self.fitness_evaluation(new_population)
                 wheel = self.get_roulette_wheel(new_population)
                 population = new_population
@@ -744,9 +1102,21 @@ class GA_SEAD(object):
                     stale_generations = 0
                 else:
                     stale_generations += 1
+                if self.stagnation_chaos and self._should_apply_stagnation_chaos(stale_generations, chaos_perturbations):
+                    population = self.apply_stagnation_chaos(population)
+                    self.fitness_evaluation(population)
+                    wheel = self.get_roulette_wheel(population)
+                    current_best = max([_.fitness_value for _ in population])
+                    if self._is_meaningful_improvement(current_best, best_fitness):
+                        best_fitness = current_best
+                    stale_generations = 0
+                    chaos_perturbations += 1
                 if self._should_stop_early(iteration, stale_generations, start_time, time_interval):
                     break
-            return self.find_best_solution(population), population
+            best_solution = self.find_best_solution(population)
+            if time.time() - start_time <= time_interval:
+                best_solution = self.local_refine_solution(best_solution)
+            return best_solution, population
         else:
             chromosome = self.Chromosome([[] for _ in range(5)])
             self.fitness_evaluation([chromosome])
@@ -901,6 +1271,7 @@ class InformationOfUAVs(object):
 
 if __name__ == "__main__":
     # targets
+
     targets = [[3100, 2200], [500, 3700], [2300, 2500], [2000, 3900], [4450, 3600], [4630, 4780], [1400, 4500]]
     # UAVs
     UAV_ID = [1, 2, 3, 4, 5, 6]
@@ -916,7 +1287,9 @@ if __name__ == "__main__":
     uav_info = InformationOfUAVs(UAV_ID, UAV_type, UAV_state, cruising_speed, minimum_turning_radii, base_configuration)
 
     population_size = 300
-    iteration = 100
+    iteration = 300
+    print("iteratiosjhghjgjhada空间看你能拿,nsn",iteration);
     ga = GA_SEAD(targets, population_size)
-    solution, ga_population, convergence = ga.run_GA(iteration, uav_info)
+    solution, ga_population, convergence = ga.run_GA_multi_start(iteration, uav_info, base_seed=20260603)
+    print(f"Multi-start info: {ga.multi_start_info}")
     ga.plot_result(solution, convergence)

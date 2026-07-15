@@ -6,7 +6,7 @@ import builtins
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
 from datetime import datetime
-from math import cos, sin, hypot, exp
+from math import cos, sin, hypot
 from typing import Optional
 
 import dubins
@@ -20,6 +20,13 @@ from subsystem import SubsystemSelector
 from swarmReliability import ConsecutiveKOutOfN
 
 try:
+    from scipy.special import gammainc
+    SCIPY_AVAILABLE = True
+except Exception:
+    gammainc = None
+    SCIPY_AVAILABLE = False
+
+try:
     import torch
     from torch import nn
     from torch.nn import functional as F
@@ -31,6 +38,12 @@ except Exception:
     TORCH_AVAILABLE = False
 
 plt.rcParams['font.family'] = 'WenQuanYi Micro Hei'
+
+DEFAULT_GAMMA_PARAMETER_DICT = {
+    1: {"shape_rate": 2.55, "scale": 1.00, "limit": 100.0},
+    2: {"shape_rate": 2.85, "scale": 1.00, "limit": 100.0},
+    3: {"shape_rate": 2.65, "scale": 1.00, "limit": 100.0},
+}
 
 # -------------------- Console Capture (main process) --------------------
 _GLOBAL_CONSOLE_LOG = []
@@ -256,6 +269,7 @@ def build_subsystem_state(simulator, subsystem_uav_ids, reliability_history, ali
                           idle_flags, uav_positions=None):
     alive_members = []
     rel_values = []
+    latest_reliability = getattr(simulator, "latest_reliability", None)
     for uid in subsystem_uav_ids:
         if uid not in simulator.uavs[0]:
             continue
@@ -263,8 +277,15 @@ def build_subsystem_state(simulator, subsystem_uav_ids, reliability_history, ali
         if alive_state[idx] != 1:
             continue
         alive_members.append(uid)
-        rel_hist = reliability_history.get(idx, [1.0])
-        rel_values.append(rel_hist[-1] if rel_hist else 1.0)
+        if latest_reliability is not None and len(latest_reliability) > idx:
+            rel = float(latest_reliability[idx])
+        else:
+            rel_hist = reliability_history.get(idx, [1.0])
+            rel = rel_hist[-1] if rel_hist else 1.0
+        if not np.isfinite(rel):
+            print(f"⚠ Invalid reliability for UAV {uid} in subsystem input; clipped to 0.0")
+            rel = 0.0
+        rel_values.append(float(np.clip(rel, 0.0, 1.0)))
     if rel_values:
         r_min = float(min(rel_values))
         r_mean = float(sum(rel_values) / len(rel_values))
@@ -1117,6 +1138,8 @@ def run_main_process(simulator, uav, u2u_communication, gcs_init_solution_queue,
     task_type = ["reconnaissance task", "attack task", "verification task"]
 
     current_reliability = 1.0
+    current_degradation = 0.0
+    current_health = 100.0
     in_subsystem = False
     subsystem_members = []
     scope_uav_ids = self.uavs[0][:]
@@ -1236,7 +1259,15 @@ def run_main_process(simulator, uav, u2u_communication, gcs_init_solution_queue,
 
     start_time = time.time()
     while True:
-        current_reliability = uav.get_reliability(time.time() - start_time, cumulative_distance)
+        sim_elapsed = time.time() - start_time
+        current_degradation = uav.update_degradation(sim_elapsed)
+        current_reliability = uav.get_reliability(sim_elapsed, cumulative_distance)
+        current_health = uav.get_health_percentage()
+        if not (np.isfinite(current_reliability) and np.isfinite(current_degradation) and np.isfinite(current_health)):
+            raise RuntimeError(
+                f"UAV {uav.id} invalid Gamma state: "
+                f"R={current_reliability}, X={current_degradation}, H={current_health}"
+            )
 
         # 子系统消息：只有在成员内才转入分布式重规划
         if subsystem_queue and not subsystem_queue.empty():
@@ -1298,12 +1329,15 @@ def run_main_process(simulator, uav, u2u_communication, gcs_init_solution_queue,
             except Exception as e:
                 print(f"⚠  [UAV {uav.id}] Error processing subsystem message: {e}")
 
-        if uav.check_failure(time.time() - start_time, self.failure_threshold, cumulative_distance):
-            print(f'💥 [UAV {uav.id}] FAILED at t={np.round(time.time() - start_time, 3)}s')
+        if uav.check_failure(sim_elapsed, self.failure_threshold, cumulative_distance,
+                             current_reliability=current_reliability):
+            print(f'💥 [UAV {uav.id}] FAILED at t={np.round(sim_elapsed, 3)}s')
             print(f'   Reliability: {current_reliability:.4f} < {self.failure_threshold}')
+            print(f'   Degradation: {current_degradation:.4f}, Health: {current_health:.2f}%')
             uav.is_failed = True
-            uav.failure_time = time.time() - start_time
-            u2g.put([223, uav.id, x_n, y_n, current_reliability, terminated_tasks])
+            uav.failure_time = sim_elapsed
+            u2g.put([223, uav.id, x_n, y_n, current_reliability, terminated_tasks,
+                     current_degradation, current_health])
             print(f"💀 [UAV {uav.id}] Exiting immediately...")
             u2g.put([44, uav.id])
             break
@@ -1325,7 +1359,7 @@ def run_main_process(simulator, uav, u2u_communication, gcs_init_solution_queue,
                 previous_u2g_time = time.time()
                 # Keep GCS packet format consistent: [msg_type, uav_id, x, y, t, yaw, reliability, is_idle, ...]
                 u2g.put([0, uav.id, x_n, y_n, time.time(), theta_n, current_reliability, 1,
-                         local_subsystem_epoch])
+                         local_subsystem_epoch, current_degradation, current_health])
             time.sleep(0.02)
             continue
 
@@ -1544,15 +1578,18 @@ def run_main_process(simulator, uav, u2u_communication, gcs_init_solution_queue,
 
         if time.time() - previous_u2g_time >= 0.5:
             is_idle = int(len(target) == 0)
-            u2g.put([0, uav.id, x_n, y_n, time.time(), theta_n, current_reliability, is_idle])
+            u2g.put([0, uav.id, x_n, y_n, time.time(), theta_n, current_reliability, is_idle,
+                     local_subsystem_epoch, current_degradation, current_health])
             previous_u2g_time = time.time()
 
         if uav_failure:
             if time.time() - start_time >= uav_failure:
-                print(f'🔥 [UAV {uav.id}] Manual failure injection at t={np.round(time.time() - start_time, 3)}s')
+                manual_elapsed = time.time() - start_time
+                print(f'🔥 [UAV {uav.id}] Manual failure injection at t={np.round(manual_elapsed, 3)}s')
                 uav.is_failed = True
-                uav.failure_time = time.time() - start_time
-                u2g.put([223, uav.id, x_n, y_n, current_reliability, terminated_tasks])
+                uav.failure_time = manual_elapsed
+                u2g.put([223, uav.id, x_n, y_n, current_reliability, terminated_tasks,
+                         current_degradation, current_health])
                 print(f"💀 [UAV {uav.id}] Exiting immediately...")
                 u2g.put([44, uav.id])
                 break
@@ -1736,9 +1773,16 @@ def generate_task_sequence_plot(simulator, save_path):
 
 def finalize_simulation_outputs(simulator, realtime_plot, replan2ga, start_time, position, distance,
                                 active_subsystem, color_style, font, font0, font1, font2, base_plot_list,
-                                uav_num, reliability_history, failures, target_num, UAVs, time_history, x, y):
+                                uav_num, reliability_history, failures, target_num, UAVs, time_history, x, y,
+                                degradation_history=None, health_history=None, reliability_model_time_history=None):
     self = simulator
     mission_time = np.round(time.time() - start_time, 3)
+    if reliability_model_time_history is None:
+        reliability_model_time_history = time_history
+    if degradation_history is None:
+        degradation_history = {i: [0.0 for _ in reliability_history.get(i, [])] for i in range(uav_num)}
+    if health_history is None:
+        health_history = {i: [100.0 for _ in reliability_history.get(i, [])] for i in range(uav_num)}
     print(" Mission complete!!")
 
     replan2ga.put([44])
@@ -1763,9 +1807,13 @@ def finalize_simulation_outputs(simulator, realtime_plot, replan2ga, start_time,
     for u in range(uav_num):
         if reliability_history[u]:
             uav_type_name = uav_type_names[self.uavs[1][u]]
+            health_text = f"健康={health_history[u][-1]:.2f}% " if health_history.get(u) else ""
             print(
-                f"  UAV {self.uavs[0][u]} ({uav_type_name}, α={UAVs[u].reliability_alpha}): "
+                f"  UAV {self.uavs[0][u]} ({uav_type_name}, "
+                f"shape_rate={UAVs[u].gamma_shape_rate:.4f}, scale={UAVs[u].gamma_scale:.4f}, "
+                f"limit={UAVs[u].degradation_limit:.1f}): "
                 f"初始={reliability_history[u][0]:.4f}, 末期={reliability_history[u][-1]:.4f}, "
+                f"{health_text}"
                 f"故障={'是' if failures[u] else '否'}"
             )
     print()
@@ -1873,30 +1921,113 @@ def finalize_simulation_outputs(simulator, realtime_plot, replan2ga, start_time,
     generate_time_flow_plot(self, position, x, y, self.targets_sites, UAVs, failures,
                             active_subsystem, color_style, start_time, save_path_3)
 
-    print('✓=> 生成可靠度曲线图...')
+    print('✓=> 生成无人机剩余健康状态图...')
     fig, ax = plt.subplots(figsize=(12, 6))
+    health_xmax = 0.0
     for i in range(uav_num):
-        if len(time_history[i]) > 1:
-            uav_type_name = uav_type_names[self.uavs[1][i]]
+        if len(reliability_model_time_history[i]) > 1 and len(health_history[i]) > 1:
             line_style = '-' if self.uavs[0][i] in active_subsystem or not active_subsystem else '--'
+            n = min(len(reliability_model_time_history[i]), len(health_history[i]))
+            plot_t = list(reliability_model_time_history[i][:n])
+            plot_h = list(health_history[i][:n])
+
+            # The mission may finish before a UAV reaches zero health. Extend
+            # only the saved degradation plot to the expected failure point so
+            # the curve shows the full lifetime trend without changing simulation data.
+            if plot_t and plot_h and plot_h[-1] > 0.0:
+                last_t = float(plot_t[-1])
+                if degradation_history and i in degradation_history and len(degradation_history[i]) > 0:
+                    last_degradation = float(degradation_history[i][-1])
+                else:
+                    last_degradation = UAVs[i].degradation_limit * (1.0 - float(plot_h[-1]) / 100.0)
+                expected_rate = max(
+                    float(UAVs[i].gamma_shape_rate) * float(UAVs[i].gamma_scale),
+                    1e-9
+                )
+                remaining_degradation = max(0.0, float(UAVs[i].degradation_limit) - last_degradation)
+                if remaining_degradation > 0.0:
+                    plot_t.append(last_t + remaining_degradation / expected_rate)
+                    plot_h.append(0.0)
+
+            if plot_t:
+                health_xmax = max(health_xmax, max(plot_t))
             ax.plot(
-                time_history[i], reliability_history[i], line_style, linewidth=2, markersize=4,
-                label=f'UAV {self.uavs[0][i]} ({uav_type_name}, α={UAVs[i].reliability_alpha})',
+                plot_t, plot_h, line_style,
+                linewidth=2, markersize=4, label=f'UAV {self.uavs[0][i]}', color=color_style[i]
+            )
+    ax.set_xlabel('Model time / h', fontsize=12, fontweight='bold')
+    ax.set_ylabel('Remaining health / %', fontsize=12, fontweight='bold')
+    ax.set_title('Gamma Degradation Paths of UAVs', fontsize=14, fontweight='bold')
+    ax.legend(loc='upper right', fontsize=9, ncol=2 if uav_num > 8 else 1)
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim([0.0, 100.0])
+    ax.set_xlim(0.0, max(1.0, health_xmax))
+    ax.margins(x=0.0)
+
+    save_path_4 = os.path.join(self.save_dir, f'04_uav_health_degradation_{self.timestamp}.png')
+    plt.savefig(save_path_4, dpi=150, bbox_inches='tight')
+    print(f'✓ 无人机剩余健康状态图已保存: {save_path_4}')
+    plt.close()
+
+    print('✓=> 生成 Gamma 可靠度曲线图...')
+    fig, ax = plt.subplots(figsize=(12, 6))
+    reliability_xmax = 0.0
+    for i in range(uav_num):
+        if len(reliability_model_time_history[i]) > 1:
+            line_style = '-' if self.uavs[0][i] in active_subsystem or not active_subsystem else '--'
+            n = min(len(reliability_model_time_history[i]), len(reliability_history[i]))
+            plot_t = list(reliability_model_time_history[i][:n])
+            plot_r = list(reliability_history[i][:n])
+
+            # Saved reliability figures should show the full lifetime trend,
+            # even when the mission ends before R(t) approaches zero.
+            if plot_t and plot_r and plot_r[-1] > 1e-3:
+                def _rel_at(model_t):
+                    if model_t <= 0.0:
+                        return 1.0
+                    shape = float(UAVs[i].gamma_shape_rate) * float(model_t)
+                    threshold_argument = float(UAVs[i].degradation_limit) / float(UAVs[i].gamma_scale)
+                    return float(np.clip(gammainc(shape, threshold_argument), 0.0, 1.0))
+
+                lo = float(plot_t[-1])
+                hi = max(lo + 1.0, lo * 1.2 + 1.0)
+                for _ in range(80):
+                    if _rel_at(hi) <= 1e-3:
+                        break
+                    hi = hi * 1.5 + 1.0
+                for _ in range(80):
+                    mid = 0.5 * (lo + hi)
+                    if _rel_at(mid) <= 1e-3:
+                        hi = mid
+                    else:
+                        lo = mid
+                plot_t.append(hi)
+                plot_r.append(0.0)
+
+            if plot_t:
+                reliability_xmax = max(reliability_xmax, max(plot_t))
+            mark_every = max(1, n // 45)
+            ax.plot(
+                plot_t, plot_r, line_style,
+                linewidth=2, marker='*', markevery=mark_every, markersize=5,
+                label=f'UAV {self.uavs[0][i]}',
                 color=color_style[i]
             )
 
     ax.axhline(y=self.failure_threshold, color='r', linestyle='--', linewidth=2,
                label=f'故障阈值 ({self.failure_threshold})')
-    ax.set_xlabel('Time (s)', fontsize=12, fontweight='bold')
+    ax.set_xlabel('Model time / h', fontsize=12, fontweight='bold')
     ax.set_ylabel('Reliability R(t)', fontsize=12, fontweight='bold')
-    ax.set_title('UAV Reliability Evolution Over Time', fontsize=14, fontweight='bold')
-    ax.legend(loc='upper right', fontsize=10)
+    ax.set_title('UAV Gamma Reliability Evolution Over Model Time', fontsize=14, fontweight='bold')
+    ax.legend(loc='upper right', fontsize=9, ncol=2 if uav_num > 8 else 1)
     ax.grid(True, alpha=0.3)
-    ax.set_ylim([0.95, 1.01])
+    ax.set_ylim([0.0, 1.01])
+    ax.set_xlim(0.0, max(1.0, reliability_xmax))
+    ax.margins(x=0.0)
 
-    save_path_4 = os.path.join(self.save_dir, f'04_reliability_curve_{self.timestamp}.png')
-    plt.savefig(save_path_4, dpi=150, bbox_inches='tight')
-    print(f'✓ 可靠度曲线已保存: {save_path_4}')
+    save_path_5 = os.path.join(self.save_dir, f'05_uav_gamma_reliability_{self.timestamp}.png')
+    plt.savefig(save_path_5, dpi=150, bbox_inches='tight')
+    print(f'✓ Gamma 可靠度曲线已保存: {save_path_5}')
     plt.close()
 
     print('✓=> 生成策略曲线图 (alpha / beta)...')
@@ -2032,7 +2163,12 @@ plt.rcParams['font.family'] = 'WenQuanYi Micro Hei'
 
 
 class UAV(object):
-    def __init__(self, uav_id, uav_type, uav_velocity, uav_Rmin, initial_position, depot, reliability_alpha=0.0001):
+    def __init__(self, uav_id, uav_type, uav_velocity, uav_Rmin, initial_position, depot,
+                 reliability_alpha=0.0001, gamma_shape_rate=None, gamma_scale=None,
+                 degradation_limit=None, simulation_seconds_per_model_hour=1.0,
+                 degradation_seed=None, individual_factor=1.0):
+        if not SCIPY_AVAILABLE:
+            raise RuntimeError("Gamma reliability model requires scipy.special.gammainc.")
         self.id = uav_id
         self.type = uav_type
         self.velocity = uav_velocity
@@ -2042,22 +2178,83 @@ class UAV(object):
         self.y0 = initial_position[1]
         self.theta0 = initial_position[2]
         self.depot = depot
+        # Compatibility only. New reliability calculation uses the Gamma degradation model below.
         self.reliability_alpha = reliability_alpha
-        self.start_time = None
+        self.gamma_shape_rate = float(gamma_shape_rate if gamma_shape_rate is not None else 2.55)
+        self.gamma_scale = float(gamma_scale if gamma_scale is not None else 1.0)
+        self.degradation_limit = float(degradation_limit if degradation_limit is not None else 100.0)
+        self.simulation_seconds_per_model_hour = float(simulation_seconds_per_model_hour)
+        self.degradation_seed = degradation_seed
+        self.individual_factor = float(individual_factor)
+        self._validate_gamma_parameters()
+        self.degradation_state = 0.0
+        self.last_degradation_update_time = None
+        self.rng = np.random.default_rng(degradation_seed)
         self.is_failed = False
         self.failure_time = None
 
-    def get_reliability(self, current_time, cumulative_distance=0.0):
-        if self.start_time is None:
-            self.start_time = current_time
-        elapsed_time = current_time - self.start_time
-        reliability = exp(-(self.reliability_alpha * elapsed_time))
-        return max(0.0, min(1.0, reliability))
+    def _validate_gamma_parameters(self):
+        params = {
+            "gamma_shape_rate": self.gamma_shape_rate,
+            "gamma_scale": self.gamma_scale,
+            "degradation_limit": self.degradation_limit,
+            "simulation_seconds_per_model_hour": self.simulation_seconds_per_model_hour,
+        }
+        for name, value in params.items():
+            if (not np.isfinite(value)) or value <= 0.0:
+                raise ValueError(f"UAV {self.id} invalid Gamma parameter {name}={value}")
 
-    def check_failure(self, current_time, threshold=0.98, cumulative_distance=0.0):
+    def get_model_time(self, current_time):
+        elapsed_seconds = max(0.0, float(current_time))
+        return elapsed_seconds / self.simulation_seconds_per_model_hour
+
+    def update_degradation(self, current_time):
+        model_time = self.get_model_time(current_time)
+        if self.last_degradation_update_time is None:
+            self.last_degradation_update_time = model_time
+            return self.degradation_state
+
+        delta_time = max(0.0, model_time - self.last_degradation_update_time)
+        self.last_degradation_update_time = model_time
+        if delta_time <= 0.0:
+            return self.degradation_state
+
+        shape_increment = self.gamma_shape_rate * delta_time
+        if shape_increment > 0.0:
+            increment = self.rng.gamma(shape=shape_increment, scale=self.gamma_scale)
+            if (not np.isfinite(increment)) or increment < 0.0:
+                raise RuntimeError(f"UAV {self.id} invalid Gamma degradation increment: {increment}")
+            self.degradation_state += float(increment)
+
+        if (not np.isfinite(self.degradation_state)) or self.degradation_state < 0.0:
+            raise RuntimeError(f"UAV {self.id} invalid degradation_state={self.degradation_state}")
+        return self.degradation_state
+
+    def get_reliability(self, current_time, cumulative_distance=0.0):
+        model_time = self.get_model_time(current_time)
+        if model_time <= 0.0:
+            return 1.0
+        shape = self.gamma_shape_rate * model_time
+        threshold_argument = self.degradation_limit / self.gamma_scale
+        reliability = gammainc(shape, threshold_argument)
+        if not np.isfinite(reliability):
+            raise RuntimeError(
+                f"UAV {self.id} invalid Gamma reliability: "
+                f"shape={shape}, limit_over_scale={threshold_argument}, value={reliability}"
+            )
+        return float(np.clip(reliability, 0.0, 1.0))
+
+    def get_health_percentage(self):
+        health = 100.0 * max(0.0, 1.0 - self.degradation_state / self.degradation_limit)
+        return float(np.clip(health, 0.0, 100.0))
+
+    def check_failure(self, current_time, threshold=0.98, cumulative_distance=0.0, current_reliability=None):
         if self.is_failed:
             return True
-        current_reliability = self.get_reliability(current_time, cumulative_distance)
+        if current_reliability is None:
+            current_reliability = self.get_reliability(current_time, cumulative_distance)
+        if not np.isfinite(current_reliability):
+            raise RuntimeError(f"UAV {self.id} invalid reliability for failure check: {current_reliability}")
         if current_reliability < threshold:
             self.is_failed = True
             self.failure_time = current_time
@@ -2071,11 +2268,31 @@ class DynamicSEADMissionSimulator(object):
                  reliability_alpha_dict=None, failure_threshold=0.98, save_dir='./simulation_results',
                  enable_subsystem=True, min_member_count=2, min_subsystem_reliability=0.95,
                  enable_assist_reallocation=True, assist_replan_cooldown=2.0,
-                 enable_knowledge_transfer=True, enable_rl_decision=True):
+                 enable_knowledge_transfer=True, enable_rl_decision=True,
+                 gamma_parameter_dict=None, simulation_seconds_per_model_hour=1.0,
+                 gamma_global_seed=2026, gamma_individual_factor_range=0.04):
+        if not SCIPY_AVAILABLE:
+            raise RuntimeError("Gamma reliability model requires scipy.special.gammainc.")
         self.targets_sites = targets_sites
         self.uavs = [uav_id, uav_type, cruise_speed, turning_radii, initial_states, base_locations, [], [], [], []]
 
-        self.reliability_alpha_dict = reliability_alpha_dict
+        self.reliability_alpha_dict = reliability_alpha_dict or {1: 0.00002, 2: 0.00009, 3: 0.00003}
+        self.gamma_parameter_dict = gamma_parameter_dict or DEFAULT_GAMMA_PARAMETER_DICT
+        self.simulation_seconds_per_model_hour = float(simulation_seconds_per_model_hour)
+        self.gamma_global_seed = int(gamma_global_seed)
+        self.gamma_individual_factor_range = float(gamma_individual_factor_range)
+        if (not np.isfinite(self.simulation_seconds_per_model_hour)) or self.simulation_seconds_per_model_hour <= 0.0:
+            raise ValueError(
+                f"simulation_seconds_per_model_hour must be > 0, got {self.simulation_seconds_per_model_hour}"
+            )
+        if (not np.isfinite(self.gamma_individual_factor_range)) or self.gamma_individual_factor_range < 0.0:
+            raise ValueError(
+                f"gamma_individual_factor_range must be >= 0, got {self.gamma_individual_factor_range}"
+            )
+        self.gamma_uav_parameters = self._build_gamma_uav_parameters()
+        self.latest_reliability = None
+        self.latest_degradation = None
+        self.latest_health = None
         self.failure_threshold = failure_threshold
         self.save_dir = save_dir
 
@@ -2152,6 +2369,49 @@ class DynamicSEADMissionSimulator(object):
             os.makedirs(save_dir)
         self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.epoch = 0
+
+    def _build_gamma_uav_parameters(self):
+        params_by_id = {}
+        required_keys = ("shape_rate", "scale", "limit")
+        for idx, (uid, utype) in enumerate(zip(self.uavs[0], self.uavs[1])):
+            if utype not in self.gamma_parameter_dict:
+                raise ValueError(f"Missing Gamma parameters for UAV type {utype} (UAV {uid})")
+            base = self.gamma_parameter_dict[utype]
+            missing = [k for k in required_keys if k not in base]
+            if missing:
+                raise ValueError(f"Gamma parameter dict for UAV type {utype} missing keys: {missing}")
+
+            seed_uid = int(uid) if isinstance(uid, (int, np.integer)) else idx + 1
+            rng = np.random.default_rng(self.gamma_global_seed + seed_uid)
+            if self.gamma_individual_factor_range > 0.0:
+                individual_factor = float(rng.uniform(
+                    1.0 - self.gamma_individual_factor_range,
+                    1.0 + self.gamma_individual_factor_range
+                ))
+            else:
+                individual_factor = 1.0
+            shape_rate = float(base["shape_rate"]) * individual_factor
+            gamma_scale = float(base["scale"])
+            degradation_limit = float(base["limit"])
+            degradation_seed = int(self.gamma_global_seed + 10000 + seed_uid)
+
+            for name, value in (
+                ("shape_rate", shape_rate),
+                ("scale", gamma_scale),
+                ("limit", degradation_limit),
+            ):
+                if (not np.isfinite(value)) or value <= 0.0:
+                    raise ValueError(f"UAV {uid} invalid Gamma {name}={value}")
+
+            params_by_id[uid] = {
+                "shape_rate": shape_rate,
+                "scale": gamma_scale,
+                "limit": degradation_limit,
+                "simulation_seconds_per_model_hour": self.simulation_seconds_per_model_hour,
+                "degradation_seed": degradation_seed,
+                "individual_factor": individual_factor,
+            }
+        return params_by_id
 
     def _record_policy_point(self, event_time, subsystem_id, trigger, decision,
                              alpha_rebuild, beta_internal, beta_external,
@@ -2257,6 +2517,7 @@ class DynamicSEADMissionSimulator(object):
     def collect_uav_states(self, position, reliability_history, UAVs):
         uav_positions = {}
         uav_reliabilities = {}
+        latest_reliability = getattr(self, "latest_reliability", None)
         for i, uav in enumerate(UAVs):
             if position[i]:
                 last_pos = position[i][-1]
@@ -2264,10 +2525,18 @@ class DynamicSEADMissionSimulator(object):
             else:
                 uav_positions[uav.id] = [uav.x0, uav.y0, uav.theta0]
 
-            if reliability_history[i]:
-                uav_reliabilities[uav.id] = reliability_history[i][-1]
+            if latest_reliability is not None and len(latest_reliability) > i:
+                rel = float(latest_reliability[i])
+            elif reliability_history[i]:
+                rel = reliability_history[i][-1]
             else:
-                uav_reliabilities[uav.id] = 1.0
+                rel = 1.0
+            if getattr(uav, "is_failed", False):
+                rel = 0.0
+            if not np.isfinite(rel):
+                print(f"⚠ Invalid latest reliability for UAV {uav.id}; clipped to 0.0")
+                rel = 0.0
+            uav_reliabilities[uav.id] = float(np.clip(rel, 0.0, 1.0))
 
         return uav_positions, uav_reliabilities
 
@@ -2593,9 +2862,21 @@ class DynamicSEADMissionSimulator(object):
         # GCS -> 每个UAV 的初始解下发队列
         gcs_init_solution_queues = [mp.Queue() for _ in range(uav_num)]
 
-        UAVs = [UAV(self.uavs[0][n], self.uavs[1][n], self.uavs[2][n], self.uavs[3][n],
-                    self.uavs[4][n], self.uavs[5][n], self.reliability_alpha_dict[self.uavs[1][n]])
-                for n in range(uav_num)]
+        UAVs = []
+        for n in range(uav_num):
+            uid = self.uavs[0][n]
+            params = self.gamma_uav_parameters[uid]
+            UAVs.append(UAV(
+                uid, self.uavs[1][n], self.uavs[2][n], self.uavs[3][n],
+                self.uavs[4][n], self.uavs[5][n],
+                reliability_alpha=self.reliability_alpha_dict.get(self.uavs[1][n], 0.0),
+                gamma_shape_rate=params["shape_rate"],
+                gamma_scale=params["scale"],
+                degradation_limit=params["limit"],
+                simulation_seconds_per_model_hour=params["simulation_seconds_per_model_hour"],
+                degradation_seed=params["degradation_seed"],
+                individual_factor=params["individual_factor"],
+            ))
 
         replan_process = mp.Process(
             target=self.task_allocation_process_replan,
@@ -2614,11 +2895,18 @@ class DynamicSEADMissionSimulator(object):
         distance = [0 for _ in range(uav_num)]
         state, completed = [1 for _ in range(uav_num)], [0 for _ in range(uav_num)]
         failures = [0 for _ in range(uav_num)]
+        self.latest_reliability = np.ones(uav_num, dtype=float)
+        self.latest_degradation = np.zeros(uav_num, dtype=float)
+        self.latest_health = np.full(uav_num, 100.0, dtype=float)
         reliability_history = {i: [1.0] for i in range(uav_num)}
+        degradation_history = {i: [0.0] for i in range(uav_num)}
+        health_history = {i: [100.0] for i in range(uav_num)}
         time_history = {i: [0.0] for i in range(uav_num)}
+        reliability_model_time_history = {i: [0.0] for i in range(uav_num)}
         active_subsystem = []
         all_completed_tasks = []
         idle_flags = {uid: False for uid in self.uavs[0]}
+        gamma_debug_printed = False
 
         # 子系统轮次标识
         subsystem_epoch = 0
@@ -2669,10 +2957,17 @@ class DynamicSEADMissionSimulator(object):
         start_time = time.time()
         print("模拟开始!")
         print(f"故障阈值: {self.failure_threshold}")
-        print("各UAV类型的可靠度衰减系数(α):")
-        for uav_type, alpha in self.reliability_alpha_dict.items():
-            uav_type_name = ["", "侦察型", "攻击型", "弹药型"][uav_type]
-            print(f"  类型{uav_type} ({uav_type_name}): α = {alpha}")
+        print("Gamma 单机可靠度模型参数:")
+        print(f"  simulation_seconds_per_model_hour = {self.simulation_seconds_per_model_hour}")
+        for uav in UAVs:
+            uav_type_name = ["", "侦察型", "攻击型", "弹药型"][uav.type]
+            print(
+                f"  UAV {uav.id} | type={uav.type}({uav_type_name}) | "
+                f"gamma_shape_rate={uav.gamma_shape_rate:.6f} | "
+                f"gamma_scale={uav.gamma_scale:.6f} | "
+                f"degradation_limit={uav.degradation_limit:.6f} | "
+                f"seed={uav.degradation_seed} | factor={uav.individual_factor:.5f}"
+            )
         print(f"子系统选择: {'启用' if self.enable_subsystem else '禁用'}")
         if self.enable_subsystem:
             print(f"  Min Members: {self.min_member_count} (hard)")
@@ -2688,6 +2983,8 @@ class DynamicSEADMissionSimulator(object):
                 for i, proc in enumerate(main_processes):
                     if state[i] == 1 and (not proc.is_alive()):
                         state[i] = 0
+                        if self.latest_reliability is not None and len(self.latest_reliability) > i:
+                            self.latest_reliability[i] = 0.0
                         print(f"⚠️  [GCS] UAV {self.uavs[0][i]} process exited without [44], force mark shutdown.")
                 continue
 
@@ -2795,20 +3092,34 @@ class DynamicSEADMissionSimulator(object):
 
                 failed_uav_id = surveillance[1]
                 failure_pos = [surveillance[2], surveillance[3]]
-                failure_reliability = surveillance[4]
+                failure_reliability = float(surveillance[4])
                 failed_terminated_tasks = surveillance[5] if len(surveillance) > 5 else []
+                failure_degradation = float(surveillance[6]) if len(surveillance) > 6 else 0.0
+                failure_health = float(surveillance[7]) if len(surveillance) > 7 else 100.0
 
                 failed_idx = self.uavs[0].index(failed_uav_id)
+                failure_rel_time = time.time() - start_time
+                failure_model_time = failure_rel_time / self.simulation_seconds_per_model_hour
+                state[failed_idx] = 0
+                reliability_history[failed_idx].append(float(np.clip(failure_reliability, 0.0, 1.0)))
+                degradation_history[failed_idx].append(float(max(0.0, failure_degradation)))
+                health_history[failed_idx].append(float(np.clip(failure_health, 0.0, 100.0)))
+                time_history[failed_idx].append(failure_rel_time)
+                reliability_model_time_history[failed_idx].append(failure_model_time)
+                self.latest_reliability[failed_idx] = 0.0
+                self.latest_degradation[failed_idx] = float(max(0.0, failure_degradation))
+                self.latest_health[failed_idx] = float(np.clip(failure_health, 0.0, 100.0))
                 # Sync failure state in GCS-side UAV objects immediately.
                 if 0 <= failed_idx < len(UAVs):
                     UAVs[failed_idx].is_failed = True
-                    UAVs[failed_idx].failure_time = time.time() - start_time
+                    UAVs[failed_idx].failure_time = failure_rel_time
                 failures[failed_idx] = max(0, len(position[failed_idx]) - 1)
                 failure_uav_list.append(failure_pos)
 
 
-                print(f"UAV {failed_uav_id} FAILED at t={np.round(time.time() - start_time, 2)}s")
+                print(f"UAV {failed_uav_id} FAILED at t={np.round(failure_rel_time, 2)}s")
                 print(f"Reliability: {failure_reliability:.4f}")
+                print(f"Gamma degradation: {failure_degradation:.4f}, health: {failure_health:.2f}%")
                 print(f"Completed tasks: {len(failed_terminated_tasks)}")
                 print(f"{'💥' * 30}")
 
@@ -2955,7 +3266,10 @@ class DynamicSEADMissionSimulator(object):
 
             elif surveillance[0] == 44:
                 shutdown_uav_id = surveillance[1]
-                state[self.uavs[0].index(shutdown_uav_id)] = 0
+                shutdown_idx = self.uavs[0].index(shutdown_uav_id)
+                state[shutdown_idx] = 0
+                if self.latest_reliability is not None and len(self.latest_reliability) > shutdown_idx:
+                    self.latest_reliability[shutdown_idx] = 0.0
                 print(f"🛑[UAV {shutdown_uav_id}] Shut down at t={np.round(time.time() - start_time, 2)}s")
 
                 # Keep subsystem scope synced when a member shuts down naturally.
@@ -3143,11 +3457,41 @@ class DynamicSEADMissionSimulator(object):
                 y[index].append(surveillance[3])
                 yaw[index] = surveillance[5]
                 yaw_list[index].append(surveillance[5])
-                reliability = surveillance[6] if len(surveillance) > 6 else 1.0
+                reliability = float(surveillance[6]) if len(surveillance) > 6 else 1.0
                 is_idle = int(surveillance[7]) if len(surveillance) > 7 else 0
+                degradation = float(surveillance[9]) if len(surveillance) > 9 else 0.0
+                health = float(surveillance[10]) if len(surveillance) > 10 else 100.0
+                if not np.isfinite(reliability):
+                    print(f"⚠ Invalid reliability packet from UAV {surveillance[1]}; clipped to 0.0")
+                    reliability = 0.0
+                if not np.isfinite(degradation):
+                    print(f"⚠ Invalid degradation packet from UAV {surveillance[1]}; clipped to 0.0")
+                    degradation = 0.0
+                if not np.isfinite(health):
+                    print(f"⚠ Invalid health packet from UAV {surveillance[1]}; clipped to 100.0")
+                    health = 100.0
+                reliability = float(np.clip(reliability, 0.0, 1.0))
+                degradation = float(max(0.0, degradation))
+                health = float(np.clip(health, 0.0, 100.0))
+                model_t = rel_t / self.simulation_seconds_per_model_hour
                 idle_flags[surveillance[1]] = bool(is_idle)
+                self.latest_reliability[index] = reliability if state[index] == 1 else 0.0
+                self.latest_degradation[index] = degradation
+                self.latest_health[index] = health
                 reliability_history[index].append(reliability)
+                degradation_history[index].append(degradation)
+                health_history[index].append(health)
                 time_history[index].append(rel_t)
+                reliability_model_time_history[index].append(model_t)
+
+                if not gamma_debug_printed:
+                    print(
+                        "[GammaFlow] "
+                        f"UAV ID={surveillance[1]}, current reliability={reliability:.6f}, "
+                        f"current degradation={degradation:.6f}, current health={health:.2f}%, "
+                        f"current subsystem/swarm reliability input={self.latest_reliability[index]:.6f}"
+                    )
+                    gamma_debug_printed = True
 
                 if realtime_plot:
                     ax_trajectory.cla()
@@ -3191,22 +3535,24 @@ class DynamicSEADMissionSimulator(object):
 
                     uav_type_labels = ["", "侦察型", "攻击型", "弹药型"]
                     for u in range(uav_num):
-                        if len(time_history[u]) > 1:
+                        if len(reliability_model_time_history[u]) > 1:
                             uav_type_name = uav_type_labels[self.uavs[1][u]]
                             line_style = '-' if u + 1 in active_subsystem or not active_subsystem else '--'
                             alpha_val = 1.0 if u + 1 in active_subsystem or not active_subsystem else 0.3
-                            ax_reliability.plot(time_history[u], reliability_history[u],
+                            ax_reliability.plot(reliability_model_time_history[u], reliability_history[u],
                                                 line_style, linewidth=2, markersize=3, alpha=alpha_val,
                                                 label=f'UAV {self.uavs[0][u]} ({uav_type_name})', color=color_style[u])
 
                     ax_reliability.axhline(y=self.failure_threshold, color='r', linestyle='--',
                                            linewidth=2, label=f'故障阈值 ({self.failure_threshold})')
-                    ax_reliability.set_xlabel('Time (s)', fontsize=11, fontweight='bold')
+                    ax_reliability.set_xlabel('Model time / h', fontsize=11, fontweight='bold')
                     ax_reliability.set_ylabel('Reliability R(t)', fontsize=11, fontweight='bold')
-                    ax_reliability.set_title('实时可靠度演化曲线', fontsize=12, fontweight='bold')
+                    ax_reliability.set_title('实时 Gamma 可靠度演化曲线', fontsize=12, fontweight='bold')
                     ax_reliability.legend(loc='upper right', fontsize=8)
                     ax_reliability.grid(True, alpha=0.3)
-                    ax_reliability.set_ylim([0.95, 1.01])
+                    ax_reliability.set_ylim([0.0, 1.01])
+                    ax_reliability.set_xlim(left=0.0)
+                    ax_reliability.margins(x=0.0)
 
                     if self.policy_history:
                         policy_sorted = sorted(self.policy_history, key=lambda e: e["time"])
@@ -3259,7 +3605,10 @@ class DynamicSEADMissionSimulator(object):
         finalize_simulation_outputs(
             self, realtime_plot, replan2ga, start_time, position, distance,
             active_subsystem, color_style, font, font0, font1, font2, base_plot_list,
-            uav_num, reliability_history, failures, target_num, UAVs, time_history, x, y
+            uav_num, reliability_history, failures, target_num, UAVs, time_history, x, y,
+            degradation_history=degradation_history,
+            health_history=health_history,
+            reliability_model_time_history=reliability_model_time_history
         )
         try:
             console_manager.shutdown()
@@ -3267,6 +3616,9 @@ class DynamicSEADMissionSimulator(object):
             pass
 
 if __name__ == '__main__':
+    print("aaaaaa")
+    print(dubins.__file__)
+
     _enable_console_capture()
     script_dir = os.path.dirname(os.path.abspath(__file__))
     targets_sites = [
@@ -3307,9 +3659,12 @@ if __name__ == '__main__':
         min_member_count=2,
         min_subsystem_reliability=0.95,
         enable_knowledge_transfer=True,
-        enable_rl_decision=True
+        enable_rl_decision=True,
+        gamma_parameter_dict=DEFAULT_GAMMA_PARAMETER_DICT,
+        simulation_seconds_per_model_hour=1.0,
+        gamma_global_seed=2026
     )
-
+    
     manual_failures = [None for _ in range(len(uav_id))]
 
     dynamic_SEAD_mission.start_simulation(
